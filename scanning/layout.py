@@ -75,7 +75,7 @@ def marker_centers():
 
 
 # --- Student ID: write-in boxes on top, digit bubbles (0-9) underneath ---
-STUDENT_ID_DIGITS = 8
+STUDENT_ID_DIGITS = 9
 
 ID_PANEL_LEFT = 300
 ID_PANEL_RIGHT = PAGE_WIDTH - MARGIN

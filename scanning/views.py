@@ -1,15 +1,26 @@
 from decimal import Decimal
 
+import math
+import os
+import tempfile
+
+import pymupdf  # PyMuPDF
+
+from .layout import QUESTIONS_PER_PAGE
+
 from django.shortcuts import render
 
-
+from .omr import detect_answers, detect_student_id
+from .matching import find_student_by_id
+from .preview import render_marked_sheet
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 
 from schools.models import Enrollment, Student
 from grading.models import Submission, GradeAuditLog, StudentAnswer
 
-from .omr import detect_answers
+from .omr import detect_answers, detect_student_id
+from .matching import find_student_by_id
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 from rest_framework.exceptions import PermissionDenied, ValidationError
@@ -72,6 +83,7 @@ class AnswerSheetDownloadView(APIView):
         return response
 
 
+
 class ScanUploadSerializer(serializers.Serializer):
     files = serializers.ListField(
         child=serializers.FileField(),
@@ -80,50 +92,50 @@ class ScanUploadSerializer(serializers.Serializer):
         max_length=50,
     )
 
-    
-def validate_files(self, files):
-    import os
-    from io import BytesIO
+    def validate_files(self, files):
+        from PIL import Image, UnidentifiedImageError
 
-    from PIL import Image, UnidentifiedImageError
+        allowed_extensions = {".jpg", ".jpeg", ".png", ".webp", ".pdf"}
+        max_file_size = 15 * 1024 * 1024
 
-    allowed_extensions = {".jpg", ".jpeg", ".png", ".webp", ".pdf"}
-    max_file_size = 15 * 1024 * 1024
+        for file in files:
+            extension = os.path.splitext(file.name)[1].lower()
 
-    for file in files:
-        extension = os.path.splitext(file.name)[1].lower()
-
-        if extension not in allowed_extensions:
-            raise serializers.ValidationError(
-                f"{file.name}: unsupported file type."
-            )
-
-        if file.size <= 0 or file.size > max_file_size:
-            raise serializers.ValidationError(
-                f"{file.name}: file must be between 1 byte and 15 MB."
-            )
-
-        file.seek(0)
-        header = file.read(16)
-        file.seek(0)
-
-        if extension == ".pdf":
-            if not header.startswith(b"%PDF-"):
+            if extension not in allowed_extensions:
                 raise serializers.ValidationError(
-                    f"{file.name}: file does not appear to be a valid PDF."
+                    f"{file.name}: unsupported file type."
                 )
-        else:
-            try:
-                image = Image.open(file)
-                image.verify()
-            except (UnidentifiedImageError, OSError, ValueError):
-                raise serializers.ValidationError(
-                    f"{file.name}: invalid or unsupported image."
-                )
-            finally:
-                file.seek(0)
 
-    return files
+            if file.size <= 0 or file.size > max_file_size:
+                raise serializers.ValidationError(
+                    f"{file.name}: file must be between 1 byte and 15 MB."
+                )
+
+            file.seek(0)
+            header = file.read(16)
+            file.seek(0)
+
+            if extension == ".pdf":
+                if not header.startswith(b"%PDF-"):
+                    raise serializers.ValidationError(
+                        f"{file.name}: invalid PDF file."
+                    )
+            else:
+                try:
+                    image = Image.open(file)
+                    image.verify()
+                except (
+                    UnidentifiedImageError,
+                    OSError,
+                    ValueError,
+                ):
+                    raise serializers.ValidationError(
+                        f"{file.name}: invalid or unsupported image."
+                    )
+                finally:
+                    file.seek(0)
+
+        return files
 
 
 class ScanUploadView(APIView):
@@ -150,7 +162,10 @@ class ScanUploadView(APIView):
             )
 
         serializer = ScanUploadSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        if not serializer.is_valid():
+            print("UPLOAD ERRORS:", serializer.errors)
+            print("FILES RECEIVED:", [(f.name, f.size, f.content_type) for f in request.FILES.getlist("files")])
+            serializer.is_valid(raise_exception=True)
         files = serializer.validated_data["files"]
 
         with transaction.atomic():
@@ -219,18 +234,15 @@ class ScanJobViewSet(viewsets.ReadOnlyModelViewSet):
         )
 
 
+
+
 class ScanFileProcessView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, scan_file_id):
         user = request.user
+        is_admin = user.is_superuser or user.role == "SCHOOL_ADMIN"
 
-        is_admin = (
-            user.is_superuser
-            or user.role == "SCHOOL_ADMIN"
-        )
-
-        # Restrict access to this teacher's own assessment scans.
         queryset = ScanFile.objects.select_related(
             "scan_job",
             "scan_job__assessment",
@@ -251,31 +263,47 @@ class ScanFileProcessView(APIView):
                 "Only scans for published assessments can be processed."
             )
 
-        if scan_file.status == ScanFile.Status.PROCESSING:
-            raise ValidationError("This file is already being processed.")
-
-        if scan_file.status == ScanFile.Status.COMPLETED:
-            raise ValidationError("This file has already been processed.")
-
-        extension = os.path.splitext(
-            scan_file.original_filename
-        )[1].lower()
-
-        if extension == ".pdf":
+        if scan_file.status in {
+            ScanFile.Status.PROCESSING,
+            ScanFile.Status.COMPLETED,
+        }:
             raise ValidationError(
-                "PDF processing is not supported yet. Upload an image file."
+                "This file is already processing or has completed."
             )
 
-        if extension not in {".jpg", ".jpeg", ".png", ".webp"}:
-            raise ValidationError("Unsupported image format.")
+        if not scan_file.file:
+            raise ValidationError("No uploaded file is attached to this scan.")
 
-        # Claim the file before starting processing.
+        extension = os.path.splitext(scan_file.original_filename)[1].lower()
+
+        if extension not in {".jpg", ".jpeg", ".png", ".webp", ".pdf"}:
+            raise ValidationError("Unsupported file format.")
+
+        questions = list(
+            assessment.questions.filter(
+                question_type="MULTIPLE_CHOICE"
+            )
+            .prefetch_related("options")
+            .order_by("order")
+        )
+
+        if not questions:
+            raise ValidationError(
+                "This assessment has no multiple-choice questions to scan."
+            )
+
+        expected_pages = max(
+            1,
+            math.ceil(len(questions) / QUESTIONS_PER_PAGE),
+        )
+
+        # Claim the file before starting CPU-intensive processing.
         with transaction.atomic():
-            scan_file = ScanFile.objects.select_for_update().get(
+            locked_file = ScanFile.objects.select_for_update().get(
                 pk=scan_file.pk
             )
 
-            if scan_file.status in {
+            if locked_file.status in {
                 ScanFile.Status.PROCESSING,
                 ScanFile.Status.COMPLETED,
             }:
@@ -283,83 +311,237 @@ class ScanFileProcessView(APIView):
                     "This file is already processing or has completed."
                 )
 
-            scan_file.status = ScanFile.Status.PROCESSING
-            scan_file.error_message = ""
-            scan_file.save(update_fields=["status", "error_message"])
-
-            job.status = "PROCESSING"
-            job.error_message = ""
-            job.save(update_fields=["status", "error_message"])
-
-        try:
-            if not scan_file.file:
-                raise ValueError("No uploaded file is attached to this scan.")
-
-            if not os.path.isfile(scan_file.file.path):
-                raise ValueError("The uploaded file could not be found.")
-
-            detected = detect_answers(
-                scan_file.file.path,
-                assessment,
-                page_index=0,
+            locked_file.status = ScanFile.Status.PROCESSING
+            locked_file.error_message = ""
+            locked_file.save(
+                update_fields=["status", "error_message"]
             )
 
-            questions_by_id = {
-                question.id: question
-                for question in assessment.questions.filter(
-                    question_type="MULTIPLE_CHOICE"
-                )
-            }
+            ScanJob.objects.filter(pk=job.pk).update(
+                status=ScanJob.Status.PROCESSING,
+                error_message="",
+                completed_at=None,
+            )
 
-            with transaction.atomic():
-                for answer in detected["answers"]:
-                    question = questions_by_id.get(
-                        answer["question_id"]
+        try:
+            source_path = scan_file.file.path
+
+            if not os.path.isfile(source_path):
+                raise ValueError("The uploaded file could not be found.")
+
+            # --------------------------------------------------
+            # 1. PREPARE PAGE IMAGES
+            # --------------------------------------------------
+            # Image uploads represent a single page. Multi-page
+            # assessments must be uploaded as one PDF.
+            with tempfile.TemporaryDirectory(prefix="papercheck_omr_") as temp_dir:
+                page_paths = []
+
+                if extension == ".pdf":
+                    with pymupdf.open(source_path) as pdf_document:
+                        if pdf_document.needs_pass:
+                            raise ValueError(
+                                "Password-protected PDFs are not supported."
+                            )
+
+                        if len(pdf_document) != expected_pages:
+                            raise ValueError(
+                                f"This assessment requires {expected_pages} "
+                                f"page(s), but the uploaded PDF contains "
+                                f"{len(pdf_document)} page(s). Upload the "
+                                f"complete answer sheet as one PDF."
+                            )
+
+                        # Render at 2x PDF resolution for reliable bubble
+                        # detection while keeping temporary files isolated.
+                        render_matrix = pymupdf.Matrix(2, 2)
+
+                        for page_index, page in enumerate(pdf_document):
+                            pixmap = page.get_pixmap(
+                                matrix=render_matrix,
+                                alpha=False,
+                            )
+                            page_path = os.path.join(
+                                temp_dir,
+                                f"page_{page_index + 1}.png",
+                            )
+                            pixmap.save(page_path)
+                            page_paths.append(page_path)
+                else:
+                    if expected_pages > 1:
+                        raise ValueError(
+                            f"This assessment needs {expected_pages} pages. "
+                            "Upload all pages together as one PDF instead "
+                            "of uploading a single image."
+                        )
+
+                    page_paths = [source_path]
+
+                if len(page_paths) != expected_pages:
+                    raise ValueError(
+                        "The number of uploaded pages does not match "
+                        "the assessment's answer sheet."
                     )
 
-                    if question is None:
-                        continue
+                # --------------------------------------------------
+                # 2. DETECT STUDENT ID FROM THE FIRST PAGE
+                # --------------------------------------------------
+                student_id_detection = detect_student_id(page_paths[0])
 
-                    ScanResult.objects.update_or_create(
-                        scan_file=scan_file,
-                        question=question,
-                        defaults={
-                            "selected_label": (
-                                answer["selected_option"] or ""
+                detected_student_id = str(
+                    student_id_detection.get("student_id") or ""
+                ).strip()
+
+                student_id_complete = bool(
+                    student_id_detection.get("complete", False)
+                )
+
+                suggested_student = None
+
+                if student_id_complete and detected_student_id:
+                    suggested_student = find_student_by_id(
+                        assessment,
+                        detected_student_id,
+                    )
+
+                # --------------------------------------------------
+                # 3. DETECT ANSWERS ON EVERY PAGE
+                # --------------------------------------------------
+                all_answers = []
+                total_questions_processed = 0
+
+                for page_index, page_path in enumerate(page_paths):
+                    page_result = detect_answers(
+                        page_path,
+                        assessment,
+                        page_index=page_index,
+                    )
+
+                    total_questions_processed += page_result[
+                        "questions_processed"
+                    ]
+
+                    for answer in page_result["answers"]:
+                        answer_with_page = dict(answer)
+                        answer_with_page["page_index"] = page_index
+                        all_answers.append(answer_with_page)
+
+                # --------------------------------------------------
+                # 4. SAVE THE COMBINED RESULTS
+                # --------------------------------------------------
+                questions_by_id = {
+                    question.id: question for question in questions
+                }
+
+                detected_question_ids = {
+                    answer["question_id"] for answer in all_answers
+                }
+
+                expected_question_ids = {
+                    question.id for question in questions
+                }
+
+                missing_question_ids = (
+                    expected_question_ids - detected_question_ids
+                )
+
+                if missing_question_ids:
+                    missing_orders = [
+                        question.order
+                        for question in questions
+                        if question.id in missing_question_ids
+                    ]
+                    raise ValueError(
+                        "OMR detection did not return every question. "
+                        f"Missing question numbers: {missing_orders}. "
+                        "Check the page alignment and scan quality."
+                    )
+
+                with transaction.atomic():
+                    locked_file = ScanFile.objects.select_for_update().get(
+                        pk=scan_file.pk
+                    )
+
+                    # A failed earlier attempt may have left partial results.
+                    # Replace them only after all pages have been detected.
+                    ScanResult.objects.filter(
+                        scan_file=locked_file
+                    ).delete()
+
+                    for answer in all_answers:
+                        question = questions_by_id.get(
+                            answer["question_id"]
+                        )
+
+                        if question is None:
+                            continue
+
+                        ScanResult.objects.create(
+                            scan_file=locked_file,
+                            question=question,
+                            selected_label=(
+                                answer.get("selected_option") or ""
                             ),
-                            "status": answer["status"],
-                            "confidence": answer["confidence"],
-                            "option_details": answer["options"],
-                        },
+                            status=answer["status"],
+                            confidence=answer["confidence"],
+                            option_details=answer["options"],
+                        )
+
+                    locked_file.detected_student_id = detected_student_id
+                    locked_file.matched_student = suggested_student
+                    locked_file.status = ScanFile.Status.COMPLETED
+                    locked_file.error_message = ""
+                    locked_file.save(
+                        update_fields=[
+                            "detected_student_id",
+                            "matched_student",
+                            "status",
+                            "error_message",
+                        ]
                     )
 
-                scan_file.status = ScanFile.Status.COMPLETED
-                scan_file.error_message = ""
-                scan_file.save(
-                    update_fields=["status", "error_message"]
-                )
+                    self.refresh_job_status(job.id)
 
-                self.refresh_job_status(job.id)
-
+            # --------------------------------------------------
+            # 5. RETURN COMBINED RESULTS
+            # --------------------------------------------------
             return Response(
                 {
                     "message": "Scan processing completed.",
                     "scan_file_id": scan_file.id,
                     "scan_job_id": str(job.id),
-                    "questions_processed": detected[
-                        "questions_processed"
-                    ],
-                    "answers": detected["answers"],
+                    "page_count": expected_pages,
+                    "questions_processed": total_questions_processed,
+                    "answers": all_answers,
+                    "detected_student_id": detected_student_id,
+                    "student_id_complete": student_id_complete,
+                    "student_id_digits": student_id_detection.get(
+                        "digits", []
+                    ),
+                    "suggested_student": (
+                        {
+                            "id": suggested_student.id,
+                            "student_id": suggested_student.student_id,
+                            "name": (
+                                f"{suggested_student.first_name} "
+                                f"{suggested_student.last_name}"
+                            ),
+                        }
+                        if suggested_student
+                        else None
+                    ),
                 },
                 status=http_status.HTTP_200_OK,
             )
 
         except Exception as exc:
-            # Record the failure so the teacher can troubleshoot it.
             with transaction.atomic():
-                scan_file.status = ScanFile.Status.FAILED
-                scan_file.error_message = str(exc)[:2000]
-                scan_file.save(
+                failed_file = ScanFile.objects.select_for_update().get(
+                    pk=scan_file.pk
+                )
+                failed_file.status = ScanFile.Status.FAILED
+                failed_file.error_message = str(exc)[:2000]
+                failed_file.save(
                     update_fields=["status", "error_message"]
                 )
 
@@ -383,21 +565,25 @@ class ScanFileProcessView(APIView):
             ScanFile.Status.FAILED,
         ]
 
-        files = job.files.all()
-        finished_count = files.filter(
+        finished_count = job.files.filter(
             status__in=terminal_statuses
         ).count()
-        failed_count = files.filter(
+
+        failed_count = job.files.filter(
             status=ScanFile.Status.FAILED
         ).count()
 
         job.processed_files = finished_count
 
         if finished_count >= job.total_files:
-            job.status = "FAILED" if failed_count else "COMPLETED"
+            job.status = (
+                ScanJob.Status.FAILED
+                if failed_count
+                else ScanJob.Status.COMPLETED
+            )
             job.completed_at = timezone.now()
         else:
-            job.status = "PROCESSING"
+            job.status = ScanJob.Status.PROCESSING
             job.completed_at = None
 
         job.save(
@@ -417,6 +603,7 @@ class ScanFileResultsView(APIView):
 
     def get(self, request, scan_file_id):
         user = request.user
+
         is_admin = (
             user.is_superuser
             or user.role == "SCHOOL_ADMIN"
@@ -468,11 +655,33 @@ class ScanFileResultsView(APIView):
                 ],
             })
 
+        unreviewed = [item for item in data if not item["reviewed"]]
+        needs_attention = [
+            item for item in unreviewed if item["status"] != "DETECTED"
+        ]
+
+        suggested = find_student_by_id(
+            scan_file.scan_job.assessment,
+            scan_file.detected_student_id,
+        )
+
         return Response({
             "scan_file_id": scan_file.id,
             "original_filename": scan_file.original_filename,
             "scan_status": scan_file.status,
+            "detected_student_id": scan_file.detected_student_id,
+            "matched_student_id": scan_file.matched_student_id,
+            "suggested_student": (
+                {
+                    "student_id": suggested.student_id,
+                    "name": f"{suggested.first_name} {suggested.last_name}",
+                }
+                if suggested
+                else None
+            ),
             "total_results": len(data),
+            "unreviewed_count": len(unreviewed),
+            "needs_attention_count": len(needs_attention),
             "results": data,
         })
 
@@ -574,6 +783,101 @@ class ScanResultReviewView(APIView):
             "reviewed_at": result.reviewed_at,
         })
 
+class ScanFileConfirmDetectedView(APIView):
+    """
+    Mark every cleanly detected answer as reviewed in one call.
+    Blank, multiple-mark, and uncertain answers stay unreviewed so the
+    teacher must resolve them individually.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, scan_file_id):
+        user = request.user
+        is_admin = user.is_superuser or user.role == "SCHOOL_ADMIN"
+
+        queryset = ScanFile.objects.all()
+
+        if not is_admin:
+            queryset = queryset.filter(
+                scan_job__assessment__classroom__teacher=user
+            )
+
+        scan_file = get_object_or_404(queryset, pk=scan_file_id)
+
+        if scan_file.status != ScanFile.Status.COMPLETED:
+            return Response(
+                {"message": "Process the scan before reviewing it."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        confirmed = ScanResult.objects.filter(
+            scan_file=scan_file,
+            status=ScanResult.Status.DETECTED,
+            reviewed=False,
+        ).update(
+            reviewed=True,
+            reviewed_by=user,
+            reviewed_at=timezone.now(),
+        )
+
+        remaining = ScanResult.objects.filter(
+            scan_file=scan_file,
+            reviewed=False,
+        ).count()
+
+        return Response({
+            "confirmed": confirmed,
+            "needs_attention_count": remaining,
+        })
+
+class ScanFilePreviewView(APIView):
+    """Return the scanned sheet as a JPEG marked with right and wrong answers."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, scan_file_id):
+        user = request.user
+        is_admin = user.is_superuser or user.role == "SCHOOL_ADMIN"
+
+        queryset = ScanFile.objects.select_related(
+            "scan_job", "scan_job__assessment"
+        )
+
+        if not is_admin:
+            queryset = queryset.filter(
+                scan_job__assessment__classroom__teacher=user
+            )
+
+        scan_file = get_object_or_404(queryset, pk=scan_file_id)
+
+        if scan_file.status != ScanFile.Status.COMPLETED:
+            return Response(
+                {"message": "Process the scan before previewing it."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not scan_file.file or not os.path.isfile(scan_file.file.path):
+            return Response(
+                {"message": "The uploaded file could not be found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        results_by_question = {
+            result.question_id: result
+            for result in ScanResult.objects.filter(scan_file=scan_file)
+        }
+
+        try:
+            jpeg = render_marked_sheet(
+                scan_file.file.path,
+                scan_file.scan_job.assessment,
+                results_by_question,
+            )
+        except ValueError as exc:
+            return Response(
+                {"message": str(exc)}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        return HttpResponse(jpeg, content_type="image/jpeg")
 
 class ScanFileGradeView(APIView):
     permission_classes = [IsAuthenticated]
@@ -821,6 +1125,9 @@ class ScanFileGradeView(APIView):
                     "answers_graded": answer_count,
                     "correct_answers": correct_count,
                     "total_points_earned": str(score),
+                    "total_points_possible": str(
+                        sum(question.points for question in questions)
+                    ),
                     "status": submission.status,
                     "approved": False,
                 },

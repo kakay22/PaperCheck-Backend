@@ -72,14 +72,6 @@ class ScanFile(models.Model):
         blank=True,
         related_name="scan_files",
     )
-
-    matched_student = models.ForeignKey(
-        "schools.Student",
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="scan_files",
-    )
     detected_student_id = models.CharField(max_length=50, blank=True)
 
     class Meta:

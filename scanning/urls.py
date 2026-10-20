@@ -1,18 +1,27 @@
 
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import ScanFileProcessView, ScanFileResultsView, ScanResultReviewView, ScanFileGradeView, SubmissionApproveView, SubmissionListView, SubmissionAuditHistoryView
 
 from .views import (
     AnswerSheetDownloadView,
     ScanUploadView,
     ScanJobViewSet,
+    ScanFileConfirmDetectedView,
+    ScanFilePreviewView,
+    ScanFileProcessView,
+    ScanFileResultsView,
+    ScanResultReviewView,
+    ScanFileGradeView,
+    SubmissionApproveView,
+    SubmissionListView,
+    SubmissionAuditHistoryView,
 )
 
 router = DefaultRouter()
 router.register("scan-jobs", ScanJobViewSet, basename="scan-job")
 
 urlpatterns = [
+    # Answer sheet and scan uploads
     path(
         "assessments/<int:assessment_id>/answer-sheet/",
         AnswerSheetDownloadView.as_view(),
@@ -24,12 +33,12 @@ urlpatterns = [
         name="scan-upload",
     ),
 
+    # Scan processing and answer review
     path(
         "scan-files/<int:scan_file_id>/process/",
         ScanFileProcessView.as_view(),
         name="scan-file-process",
     ),
-
     path(
         "scan-files/<int:scan_file_id>/results/",
         ScanFileResultsView.as_view(),
@@ -40,27 +49,39 @@ urlpatterns = [
         ScanResultReviewView.as_view(),
         name="scan-result-review",
     ),
+    path(
+        "scan-files/<int:scan_file_id>/confirm-detected/",
+        ScanFileConfirmDetectedView.as_view(),
+        name="scan-file-confirm-detected",
+    ),
+    path(
+        "scan-files/<int:scan_file_id>/preview/",
+        ScanFilePreviewView.as_view(),
+        name="scan-file-preview",
+    ),
 
+    # Grading
     path(
         "scan-files/<int:scan_file_id>/grade/",
         ScanFileGradeView.as_view(),
         name="scan-file-grade",
     ),
-
-    path(
-        "submissions/<int:submission_id>/approve/",
-        SubmissionApproveView.as_view(),
-        name="submission-approve",
-    ),
-
     path(
         "submissions/",
         SubmissionListView.as_view(),
         name="submission-list",
     ),
     path(
+        "submissions/<int:submission_id>/approve/",
+        SubmissionApproveView.as_view(),
+        name="submission-approve",
+    ),
+    path(
         "submissions/<int:submission_id>/audit-history/",
         SubmissionAuditHistoryView.as_view(),
         name="submission-audit-history",
     ),
+
+    # Scan job listing
+    path("", include(router.urls)),
 ]
