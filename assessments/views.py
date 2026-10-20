@@ -155,12 +155,16 @@ class QuestionViewSet(viewsets.ModelViewSet):
             "assessment", "assessment__classroom"
         ).prefetch_related("options")
 
+        assessment_id = self.request.query_params.get("assessment")
+        if assessment_id and assessment_id.isdigit():
+            qs = qs.filter(assessment_id=int(assessment_id))
+
         if is_school_admin(self.request.user):
-            return qs
+            return qs.order_by("order")
 
         return qs.filter(
             assessment__classroom__teacher=self.request.user
-        )
+        ).order_by("order")
 
     def perform_create(self, serializer):
         assessment = serializer.validated_data["assessment"]

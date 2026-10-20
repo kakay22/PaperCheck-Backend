@@ -553,7 +553,26 @@ class ScanResultReviewView(APIView):
             else ScanResult.Status.BLANK
         )
         result.reviewed = True
-        result
+        result.reviewed_by = user
+        result.reviewed_at = timezone.now()
+        result.save(
+            update_fields=[
+                "selected_label",
+                "status",
+                "reviewed",
+                "reviewed_by",
+                "reviewed_at",
+            ]
+        )
+
+        return Response({
+            "id": result.id,
+            "selected_label": result.selected_label,
+            "status": result.status,
+            "reviewed": True,
+            "reviewed_by": user.username,
+            "reviewed_at": result.reviewed_at,
+        })
 
 
 class ScanFileGradeView(APIView):

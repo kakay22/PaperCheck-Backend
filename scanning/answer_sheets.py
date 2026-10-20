@@ -1,4 +1,3 @@
-
 from io import BytesIO
 import math
 
@@ -6,24 +5,37 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
-
 from .layout import (
+    BUBBLE_OFFSET_X,
     BUBBLE_RADIUS,
     BUBBLE_SPACING,
-    BUBBLE_START_X,
+    COLUMN_LEFTS,
+    COLUMN_WIDTH,
     GRID_TOP,
+    ID_BUBBLE_RADIUS,
+    ID_LABEL_X,
+    ID_PANEL_BOTTOM,
+    ID_PANEL_LEFT,
+    ID_PANEL_RIGHT,
+    ID_PANEL_TOP,
     MARGIN,
+    NUMBER_RIGHT_OFFSET,
     PAGE_HEIGHT,
     PAGE_WIDTH,
-    QUESTION_X,
+    QUESTIONS_PER_COLUMN,
     QUESTIONS_PER_PAGE,
     ROW_HEIGHT,
     START_Y,
+    STUDENT_ID_DIGITS,
     bubble_center,
+    marker_rects,
     row_baseline_y,
+    student_id_box_rect,
+    student_id_bubble_center,
 )
 
 CONTENT_WIDTH = PAGE_WIDTH - (2 * MARGIN)
+MAX_CHOICES = 4  # A-D; the layout has room for four columns per question
 
 # Professional monochrome print palette
 INK = colors.HexColor("#172033")
@@ -34,8 +46,8 @@ HEADER_SHADE = colors.HexColor("#E9EEF5")
 WHITE = colors.white
 
 
-def draw_bubble(pdf, x, y, label=None, radius=6):
-    """Draw a clean, empty answer bubble for OMR scanning."""
+def draw_bubble(pdf, x, y, radius=BUBBLE_RADIUS):
+    """Draw a clean, empty bubble for OMR scanning."""
     pdf.setStrokeColor(INK)
     pdf.setLineWidth(0.9)
     pdf.circle(x, y, radius, stroke=1, fill=0)
@@ -48,16 +60,65 @@ def draw_horizontal_rule(pdf, x1, y, x2, color=LIGHT_BORDER, width=0.6):
     pdf.line(x1, y, x2, y)
 
 
+def draw_corner_markers(pdf):
+    """Draw solid black alignment squares at the four page corners."""
+    pdf.setFillColor(colors.black)
+    for x, y, w, h in marker_rects():
+        pdf.rect(x, y, w, h, stroke=0, fill=1)
+
+
+def draw_student_id_grid(pdf):
+    """Student ID: write-in box on top, digit bubbles 0-9 underneath."""
+    pdf.setStrokeColor(LIGHT_BORDER)
+    pdf.setLineWidth(0.8)
+    pdf.roundRect(
+        ID_PANEL_LEFT,
+        ID_PANEL_BOTTOM,
+        ID_PANEL_RIGHT - ID_PANEL_LEFT,
+        ID_PANEL_TOP - ID_PANEL_BOTTOM,
+        4,
+        stroke=1,
+        fill=0,
+    )
+
+    pdf.setFillColor(INK)
+    pdf.setFont("Helvetica-Bold", 7.5)
+    pdf.drawCentredString(
+        (ID_PANEL_LEFT + ID_PANEL_RIGHT) / 2,
+        ID_PANEL_TOP - 14,
+        "STUDENT ID",
+    )
+
+    # Write-in boxes
+    pdf.setStrokeColor(INK)
+    pdf.setLineWidth(0.8)
+    for position in range(STUDENT_ID_DIGITS):
+        x, y, w, h = student_id_box_rect(position)
+        pdf.rect(x, y, w, h, stroke=1, fill=0)
+
+    # Row labels 0-9
+    pdf.setFillColor(MUTED)
+    pdf.setFont("Helvetica-Bold", 7.5)
+    for digit in range(10):
+        _, y = student_id_bubble_center(0, digit)
+        pdf.drawCentredString(ID_LABEL_X, y - 2.5, str(digit))
+
+    # Digit bubbles
+    for position in range(STUDENT_ID_DIGITS):
+        for digit in range(10):
+            x, y = student_id_bubble_center(position, digit)
+            draw_bubble(pdf, x, y, radius=ID_BUBBLE_RADIUS)
+
+
 def generate_answer_sheet(assessment):
     """
-    Generate a professional printable multiple-choice answer sheet.
+    Generate a printable multiple-choice answer sheet.
 
-    Includes:
-    - Assessment header and identification details
-    - Student name, year/section, and date
-    - A/B/C/D column headers
-    - Aligned answer bubbles and alternating row shading
-    - Page numbering and scanning instructions
+    Each page holds up to 50 questions in two columns of 25, plus a
+    student ID bubble grid and four corner alignment markers.
+
+    Geometry comes from scanning/layout.py, which the OMR detector also
+    imports. Do not hard-code grid positions here.
     """
     buffer = BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=A4)
@@ -72,13 +133,12 @@ def generate_answer_sheet(assessment):
     pdf.setTitle(f"Answer Sheet - {assessment.title}")
     pdf.setAuthor("PaperCheck")
 
-    questions_per_page = QUESTIONS_PER_PAGE
-    total_pages = max(1, math.ceil(len(questions) / questions_per_page))
+    total_pages = max(1, math.ceil(len(questions) / QUESTIONS_PER_PAGE))
 
     for page_index in range(total_pages):
         page_questions = questions[
-            page_index * questions_per_page:
-            (page_index + 1) * questions_per_page
+            page_index * QUESTIONS_PER_PAGE:
+            (page_index + 1) * QUESTIONS_PER_PAGE
         ]
 
         left = MARGIN
@@ -95,30 +155,17 @@ def generate_answer_sheet(assessment):
 
         pdf.setFillColor(MUTED)
         pdf.setFont("Helvetica-Bold", 7.5)
-        pdf.drawRightString(
-            right,
-            top + 2,
-            "MULTIPLE-CHOICE ANSWER SHEET",
-        )
+        pdf.drawRightString(right, top + 2, "MULTIPLE-CHOICE ANSWER SHEET")
 
         draw_horizontal_rule(pdf, left, top - 11, right, INK, 1.2)
 
-        # Assessment title
         pdf.setFillColor(INK)
         pdf.setFont("Helvetica-Bold", 13)
-        pdf.drawString(
-            left,
-            PAGE_HEIGHT - 78,
-            assessment.title[:65],
-        )
+        pdf.drawString(left, PAGE_HEIGHT - 78, assessment.title[:65])
 
         pdf.setFillColor(MUTED)
         pdf.setFont("Helvetica", 8)
-        pdf.drawString(
-            left,
-            PAGE_HEIGHT - 94,
-            f"ASSESSMENT ID: {assessment.pk}",
-        )
+        pdf.drawString(left, PAGE_HEIGHT - 94, f"ASSESSMENT ID: {assessment.pk}")
         pdf.drawRightString(
             right,
             PAGE_HEIGHT - 94,
@@ -126,17 +173,18 @@ def generate_answer_sheet(assessment):
         )
 
         # --------------------------------------------------
-        # STUDENT INFORMATION PANEL
+        # STUDENT INFORMATION (left of the ID grid)
         # --------------------------------------------------
-        panel_top = PAGE_HEIGHT - 111
-        panel_bottom = PAGE_HEIGHT - 177
+        info_width = ID_PANEL_LEFT - 12 - left
+        info_top = PAGE_HEIGHT - 108
+        info_bottom = PAGE_HEIGHT - 212
 
         pdf.setFillColor(ROW_SHADE)
         pdf.roundRect(
             left,
-            panel_bottom,
-            CONTENT_WIDTH,
-            panel_top - panel_bottom,
+            info_bottom,
+            info_width,
+            info_top - info_bottom,
             5,
             stroke=0,
             fill=1,
@@ -144,50 +192,25 @@ def generate_answer_sheet(assessment):
 
         pdf.setFillColor(INK)
         pdf.setFont("Helvetica-Bold", 8)
-        pdf.drawString(left + 12, panel_top - 16, "STUDENT INFORMATION")
+        pdf.drawString(left + 12, info_top - 16, "STUDENT INFORMATION")
 
-        # Student name
-        pdf.setFillColor(MUTED)
-        pdf.setFont("Helvetica-Bold", 7)
-        pdf.drawString(left + 12, panel_top - 32, "STUDENT NAME")
-
-        pdf.setStrokeColor(INK)
+        fields = [("NAME", 40), ("YEAR / SECTION", 64), ("DATE", 88)]
         pdf.setLineWidth(0.65)
-        pdf.line(
-            left + 100,
-            panel_top - 34,
-            right - 12,
-            panel_top - 34,
-        )
+        for label, offset in fields:
+            pdf.setFillColor(MUTED)
+            pdf.setFont("Helvetica-Bold", 7)
+            pdf.drawString(left + 12, info_top - offset, label)
 
-        # Year / Section
-        pdf.setFillColor(MUTED)
-        pdf.setFont("Helvetica-Bold", 7)
-        pdf.drawString(left + 12, panel_top - 52, "YEAR / SECTION")
-
-        pdf.setStrokeColor(INK)
-        pdf.line(
-            left + 100,
-            panel_top - 54,
-            left + 245,
-            panel_top - 54,
-        )
-
-        # Date
-        pdf.setFillColor(MUTED)
-        pdf.setFont("Helvetica-Bold", 7)
-        pdf.drawString(left + 260, panel_top - 52, "DATE")
-
-        pdf.setStrokeColor(INK)
-        pdf.line(
-            left + 292,
-            panel_top - 54,
-            right - 12,
-            panel_top - 54,
-        )
+            pdf.setStrokeColor(INK)
+            pdf.line(
+                left + 88,
+                info_top - offset - 2,
+                left + info_width - 12,
+                info_top - offset - 2,
+            )
 
         # Instructions
-        instructions_y = PAGE_HEIGHT - 195
+        instructions_y = PAGE_HEIGHT - 230
 
         pdf.setFillColor(INK)
         pdf.setFont("Helvetica-Bold", 8)
@@ -195,115 +218,100 @@ def generate_answer_sheet(assessment):
 
         pdf.setFillColor(MUTED)
         pdf.setFont("Helvetica", 7.5)
-        pdf.drawString(
-            left,
-            instructions_y - 13,
-            "Shade ONE circle completely for each question using a dark pencil.",
-        )
-        pdf.drawString(
-            left,
-            instructions_y - 25,
-            "Keep this sheet flat and clean. Avoid stray marks and select only one answer.",
-        )
+        instruction_lines = [
+            "Use a dark pencil. Shade ONE circle per question.",
+            "Fill the circle completely; erase changes cleanly.",
+            "Student ID: write one digit in each box, then shade",
+            "the matching circle below it. Keep the sheet flat.",
+        ]
+        for line_index, line in enumerate(instruction_lines):
+            pdf.drawString(left, instructions_y - 13 - line_index * 11, line)
+
+        # --------------------------------------------------
+        # STUDENT ID GRID
+        # --------------------------------------------------
+        draw_student_id_grid(pdf)
 
         # --------------------------------------------------
         # ANSWER GRID
         # --------------------------------------------------
-        grid_top = GRID_TOP
-        start_y = START_Y
+        columns_used = 2 if len(page_questions) > QUESTIONS_PER_COLUMN else 1
 
-        row_height = ROW_HEIGHT
-        question_x = QUESTION_X
-        bubble_start_x = BUBBLE_START_X
-        bubble_spacing = BUBBLE_SPACING
-
-        # Get available answer labels from the first question.
-        header_options = (
-            list(page_questions[0].options.all().order_by("label"))
-            if page_questions
-            else []
-        )
-
-        # Grid section heading
         pdf.setFillColor(INK)
         pdf.setFont("Helvetica-Bold", 9)
-        pdf.drawString(left, grid_top, "ANSWER GRID")
+        pdf.drawString(left, GRID_TOP, "ANSWER GRID")
 
         pdf.setFillColor(MUTED)
         pdf.setFont("Helvetica", 7)
         pdf.drawRightString(
             right,
-            grid_top,
+            GRID_TOP,
             f"{len(page_questions)} QUESTIONS ON THIS PAGE",
         )
 
-        # Column header background
-        header_y = start_y + 8
+        header_y = START_Y + 8
 
         pdf.setFillColor(HEADER_SHADE)
-        pdf.roundRect(
-            left,
-            header_y - 5,
-            CONTENT_WIDTH,
-            24,
-            3,
-            stroke=0,
-            fill=1,
+        pdf.roundRect(left, header_y - 5, CONTENT_WIDTH, 24, 3, stroke=0, fill=1)
+
+        header_options = (
+            list(page_questions[0].options.all().order_by("label"))[:MAX_CHOICES]
+            if page_questions
+            else []
         )
 
         pdf.setFillColor(INK)
         pdf.setFont("Helvetica-Bold", 7.5)
-        pdf.drawString(question_x, header_y + 3, "QUESTION")
+        for column in range(columns_used):
+            col_left = COLUMN_LEFTS[column]
+            pdf.drawRightString(
+                col_left + NUMBER_RIGHT_OFFSET, header_y + 3, "NO."
+            )
+            for option_index, option in enumerate(header_options):
+                x = col_left + BUBBLE_OFFSET_X + option_index * BUBBLE_SPACING
+                pdf.drawCentredString(x, header_y + 3, option.label)
 
-        for option_index, option in enumerate(header_options):
-            x = bubble_start_x + option_index * bubble_spacing
-
-            if x + 12 > right:
-                break
-
-            pdf.drawCentredString(x, header_y + 3, option.label)
+        # Thin separator between the two columns
+        if columns_used == 2:
+            gap_x = (COLUMN_LEFTS[0] + COLUMN_WIDTH + COLUMN_LEFTS[1]) / 2
+            bottom_y = row_baseline_y(QUESTIONS_PER_COLUMN - 1) - 8
+            pdf.setStrokeColor(LIGHT_BORDER)
+            pdf.setLineWidth(0.6)
+            pdf.line(gap_x, header_y - 5, gap_x, bottom_y)
 
         # Question rows
-        for row_index, question in enumerate(page_questions):
-            y = start_y - 18 - row_index * row_height
+        for slot, question in enumerate(page_questions):
+            column, row = divmod(slot, QUESTIONS_PER_COLUMN)
+            col_left = COLUMN_LEFTS[column]
+            y = row_baseline_y(row)
 
-            if y < 47:
-                break
-
-            # Alternating row shading
-            if row_index % 2 == 0:
+            if row % 2 == 0:
                 pdf.setFillColor(ROW_SHADE)
                 pdf.rect(
-                    left,
+                    col_left,
                     y - 8,
-                    CONTENT_WIDTH,
-                    row_height,
+                    COLUMN_WIDTH,
+                    ROW_HEIGHT,
                     stroke=0,
                     fill=1,
                 )
 
-            # Question number
             pdf.setFillColor(INK)
             pdf.setFont("Helvetica-Bold", 8.5)
-            pdf.drawString(question_x, y - 1, str(question.order))
+            pdf.drawRightString(
+                col_left + NUMBER_RIGHT_OFFSET, y - 1, f"{question.order}."
+            )
 
-            # Answer bubbles aligned beneath A/B/C/D
-            options = list(question.options.all().order_by("label"))
+            options = list(question.options.all().order_by("label"))[:MAX_CHOICES]
+            for option_index, _option in enumerate(options):
+                bx, by = bubble_center(slot, option_index)
+                draw_bubble(pdf, bx, by, radius=BUBBLE_RADIUS)
 
-            for option_index, option in enumerate(options):
-                x = bubble_start_x + option_index * bubble_spacing
-
-                if x + 12 > right:
-                    break
-
-                draw_bubble(pdf, x, y + 1, radius=6)
-
-            # Subtle row divider
             draw_horizontal_rule(
                 pdf,
-                left,
+                col_left,
                 y - 8,
-                right,
+                col_left + COLUMN_WIDTH,
                 LIGHT_BORDER,
                 0.35,
             )
@@ -313,14 +321,7 @@ def generate_answer_sheet(assessment):
         # --------------------------------------------------
         footer_y = 35
 
-        draw_horizontal_rule(
-            pdf,
-            left,
-            footer_y + 12,
-            right,
-            LIGHT_BORDER,
-            0.7,
-        )
+        draw_horizontal_rule(pdf, left, footer_y + 12, right, LIGHT_BORDER, 0.7)
 
         pdf.setFillColor(MUTED)
         pdf.setFont("Helvetica-Bold", 7)
@@ -333,11 +334,9 @@ def generate_answer_sheet(assessment):
             "For machine scanning: avoid folds and stray marks.",
         )
 
-        pdf.drawRightString(
-            right,
-            footer_y,
-            f"ID: {assessment.pk}",
-        )
+        pdf.drawRightString(right, footer_y, f"ID: {assessment.pk}")
+
+        draw_corner_markers(pdf)
 
         pdf.showPage()
 
