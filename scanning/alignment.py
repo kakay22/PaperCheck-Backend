@@ -68,25 +68,63 @@ def _square_candidates(binary):
     return found
 
 
+from itertools import combinations
+
+PAGE_ASPECT = 595.28 / 841.89  # width / height of the A4 sheet
+
+
+def _order_quad(points):
+    """Order four points as TL, TR, BL, BR."""
+    pts = sorted(points, key=lambda p: p[1])
+    top = sorted(pts[:2], key=lambda p: p[0])
+    bottom = sorted(pts[2:], key=lambda p: p[0])
+    return [top[0], top[1], bottom[0], bottom[1]]
+
+
 def _pick_corners(candidates, width, height):
-    """Pick the candidate nearest each image corner: TL, TR, BL, BR."""
-    targets = [(0, 0), (width, 0), (0, height), (width, height)]
-    picked = [
-        min(candidates, key=lambda p: (p[0] - tx) ** 2 + (p[1] - ty) ** 2)
-        for tx, ty in targets
-    ]
+    """Pick the four candidates that best form an A4-shaped quadrilateral."""
+    if len(candidates) > 14:
+        # Keep the candidates farthest from the image center; markers sit
+        # at the sheet's corners.
+        cx, cy = width / 2, height / 2
+        candidates = sorted(
+            candidates,
+            key=lambda p: -((p[0] - cx) ** 2 + (p[1] - cy) ** 2),
+        )[:14]
 
-    if len(set(picked)) < 4:
-        return None
+    best = None
+    best_score = 0.0
 
-    # The four markers should enclose a large part of the image.
-    quad = np.array(
-        [picked[0], picked[1], picked[3], picked[2]], dtype=np.float32
-    )
-    if cv2.contourArea(quad) < 0.2 * width * height:
-        return None
+    for combo in combinations(candidates, 4):
+        tl, tr, bl, br = _order_quad(combo)
+        quad = np.array([tl, tr, br, bl], dtype=np.float32)
 
-    return picked
+        area = cv2.contourArea(quad)
+        if area < 0.2 * width * height:
+            continue
+        if not cv2.isContourConvex(quad.astype(np.int32)):
+            continue
+
+        top = np.hypot(tr[0] - tl[0], tr[1] - tl[1])
+        bottom = np.hypot(br[0] - bl[0], br[1] - bl[1])
+        left = np.hypot(bl[0] - tl[0], bl[1] - tl[1])
+        right = np.hypot(br[0] - tr[0], br[1] - tr[1])
+
+        if min(left, right) == 0 or min(top, bottom) == 0:
+            continue
+
+        aspect = ((top + bottom) / 2) / ((left + right) / 2)
+        # Perspective changes proportions, so allow a wide tolerance.
+        mismatch = abs(aspect - PAGE_ASPECT) / PAGE_ASPECT
+        if mismatch > 0.35:
+            continue
+
+        score = area * (1 - mismatch)
+        if score > best_score:
+            best_score = score
+            best = [tl, tr, bl, br]
+
+    return best
 
 
 def align_page(image):

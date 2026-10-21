@@ -15,6 +15,7 @@ from .matching import find_student_by_id
 from .preview import render_marked_sheet
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
+from django.db.models import Sum
 
 from schools.models import Enrollment, Student
 from grading.models import Submission, GradeAuditLog, StudentAnswer
@@ -39,7 +40,7 @@ from rest_framework.response import Response
 from .models import ScanJob, ScanResult
 from .models import ScanJob, ScanFile
 
-from assessments.models import Assessment, QuestionOption
+from assessments.models import Assessment, Question, QuestionOption
 from .answer_sheets import generate_answer_sheet
 
 
@@ -280,9 +281,7 @@ class ScanFileProcessView(APIView):
             raise ValidationError("Unsupported file format.")
 
         questions = list(
-            assessment.questions.filter(
-                question_type="MULTIPLE_CHOICE"
-            )
+            assessment.questions.filter(question_type="MULTIPLE_CHOICE")
             .prefetch_related("options")
             .order_by("order")
         )
@@ -313,9 +312,7 @@ class ScanFileProcessView(APIView):
 
             locked_file.status = ScanFile.Status.PROCESSING
             locked_file.error_message = ""
-            locked_file.save(
-                update_fields=["status", "error_message"]
-            )
+            locked_file.save(update_fields=["status", "error_message"])
 
             ScanJob.objects.filter(pk=job.pk).update(
                 status=ScanJob.Status.PROCESSING,
@@ -329,12 +326,8 @@ class ScanFileProcessView(APIView):
             if not os.path.isfile(source_path):
                 raise ValueError("The uploaded file could not be found.")
 
-            # --------------------------------------------------
-            # 1. PREPARE PAGE IMAGES
-            # --------------------------------------------------
-            # Image uploads represent a single page. Multi-page
-            # assessments must be uploaded as one PDF.
             with tempfile.TemporaryDirectory(prefix="papercheck_omr_") as temp_dir:
+                # 1. Prepare page images
                 page_paths = []
 
                 if extension == ".pdf":
@@ -352,8 +345,6 @@ class ScanFileProcessView(APIView):
                                 f"complete answer sheet as one PDF."
                             )
 
-                        # Render at 2x PDF resolution for reliable bubble
-                        # detection while keeping temporary files isolated.
                         render_matrix = pymupdf.Matrix(2, 2)
 
                         for page_index, page in enumerate(pdf_document):
@@ -383,9 +374,7 @@ class ScanFileProcessView(APIView):
                         "the assessment's answer sheet."
                     )
 
-                # --------------------------------------------------
-                # 2. DETECT STUDENT ID FROM THE FIRST PAGE
-                # --------------------------------------------------
+                # 2. Detect the student ID from the first page
                 student_id_detection = detect_student_id(page_paths[0])
 
                 detected_student_id = str(
@@ -404,9 +393,7 @@ class ScanFileProcessView(APIView):
                         detected_student_id,
                     )
 
-                # --------------------------------------------------
-                # 3. DETECT ANSWERS ON EVERY PAGE
-                # --------------------------------------------------
+                # 3. Detect answers on every page
                 all_answers = []
                 total_questions_processed = 0
 
@@ -426,30 +413,22 @@ class ScanFileProcessView(APIView):
                         answer_with_page["page_index"] = page_index
                         all_answers.append(answer_with_page)
 
-                # --------------------------------------------------
-                # 4. SAVE THE COMBINED RESULTS
-                # --------------------------------------------------
-                questions_by_id = {
-                    question.id: question for question in questions
-                }
+                # 4. Validate and save the combined results
+                questions_by_id = {q.id: q for q in questions}
 
                 detected_question_ids = {
                     answer["question_id"] for answer in all_answers
                 }
-
-                expected_question_ids = {
-                    question.id for question in questions
-                }
-
+                expected_question_ids = {q.id for q in questions}
                 missing_question_ids = (
                     expected_question_ids - detected_question_ids
                 )
 
                 if missing_question_ids:
                     missing_orders = [
-                        question.order
-                        for question in questions
-                        if question.id in missing_question_ids
+                        q.order
+                        for q in questions
+                        if q.id in missing_question_ids
                     ]
                     raise ValueError(
                         "OMR detection did not return every question. "
@@ -457,21 +436,32 @@ class ScanFileProcessView(APIView):
                         "Check the page alignment and scan quality."
                     )
 
+                # Preliminary count of cleanly detected correct answers.
+                correct_map = dict(
+                    QuestionOption.objects.filter(
+                        question__assessment=assessment,
+                        question__question_type="MULTIPLE_CHOICE",
+                        is_correct=True,
+                    ).values_list("question_id", "label")
+                )
+                correct_count = sum(
+                    1
+                    for answer in all_answers
+                    if answer["status"] == "DETECTED"
+                    and correct_map.get(answer["question_id"])
+                    == answer["selected_option"]
+                )
+
                 with transaction.atomic():
                     locked_file = ScanFile.objects.select_for_update().get(
                         pk=scan_file.pk
                     )
 
-                    # A failed earlier attempt may have left partial results.
-                    # Replace them only after all pages have been detected.
-                    ScanResult.objects.filter(
-                        scan_file=locked_file
-                    ).delete()
+                    # Replace partial results from any earlier failed attempt.
+                    ScanResult.objects.filter(scan_file=locked_file).delete()
 
                     for answer in all_answers:
-                        question = questions_by_id.get(
-                            answer["question_id"]
-                        )
+                        question = questions_by_id.get(answer["question_id"])
 
                         if question is None:
                             continue
@@ -488,13 +478,11 @@ class ScanFileProcessView(APIView):
                         )
 
                     locked_file.detected_student_id = detected_student_id
-                    locked_file.matched_student = suggested_student
                     locked_file.status = ScanFile.Status.COMPLETED
                     locked_file.error_message = ""
                     locked_file.save(
                         update_fields=[
                             "detected_student_id",
-                            "matched_student",
                             "status",
                             "error_message",
                         ]
@@ -502,9 +490,7 @@ class ScanFileProcessView(APIView):
 
                     self.refresh_job_status(job.id)
 
-            # --------------------------------------------------
-            # 5. RETURN COMBINED RESULTS
-            # --------------------------------------------------
+            # 5. Return combined results
             return Response(
                 {
                     "message": "Scan processing completed.",
@@ -512,6 +498,7 @@ class ScanFileProcessView(APIView):
                     "scan_job_id": str(job.id),
                     "page_count": expected_pages,
                     "questions_processed": total_questions_processed,
+                    "correct_count": correct_count,
                     "answers": all_answers,
                     "detected_student_id": detected_student_id,
                     "student_id_complete": student_id_complete,
@@ -541,9 +528,7 @@ class ScanFileProcessView(APIView):
                 )
                 failed_file.status = ScanFile.Status.FAILED
                 failed_file.error_message = str(exc)[:2000]
-                failed_file.save(
-                    update_fields=["status", "error_message"]
-                )
+                failed_file.save(update_fields=["status", "error_message"])
 
                 self.refresh_job_status(job.id)
 
@@ -665,6 +650,20 @@ class ScanFileResultsView(APIView):
             scan_file.detected_student_id,
         )
 
+        correct_map = dict(
+            QuestionOption.objects.filter(
+                question__assessment=scan_file.scan_job.assessment,
+                is_correct=True,
+            ).values_list("question_id", "label")
+        )
+        correct_count = sum(
+            1
+            for item in data
+            if item["selected_label"]
+            and correct_map.get(item["question_id"]) == item["selected_label"]
+        )
+        blank_count = sum(1 for item in data if item["status"] == "BLANK")
+
         return Response({
             "scan_file_id": scan_file.id,
             "original_filename": scan_file.original_filename,
@@ -680,6 +679,9 @@ class ScanFileResultsView(APIView):
                 else None
             ),
             "total_results": len(data),
+            "correct_count": correct_count,
+            "blank_count": blank_count,
+            "shaded_count": len(data) - blank_count,
             "unreviewed_count": len(unreviewed),
             "needs_attention_count": len(needs_attention),
             "results": data,
@@ -810,14 +812,20 @@ class ScanFileConfirmDetectedView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        confirmed = ScanResult.objects.filter(
-            scan_file=scan_file,
-            status=ScanResult.Status.DETECTED,
-            reviewed=False,
-        ).update(
-            reviewed=True,
-            reviewed_by=user,
-            reviewed_at=timezone.now(),
+        confirmed = (
+            ScanResult.objects.filter(scan_file=scan_file, reviewed=False)
+            .exclude(
+                status__in=[
+                    ScanResult.Status.MULTIPLE_MARKS,
+                    ScanResult.Status.UNCERTAIN,
+                    ScanResult.Status.ERROR,
+                ]
+            )
+            .update(
+                reviewed=True,
+                reviewed_by=user,
+                reviewed_at=timezone.now(),
+            )
         )
 
         remaining = ScanResult.objects.filter(
@@ -1294,16 +1302,30 @@ class SubmissionListView(APIView):
 
             queryset = queryset.filter(status=submission_status)
 
-        queryset = queryset.order_by("-created_at")
+        submissions = list(queryset.order_by("-created_at"))
+
+        # Total possible points per assessment (multiple-choice only,
+        # which is what the scanner grades).
+        totals = {
+            row["assessment"]: row["total"]
+            for row in Question.objects.filter(
+                assessment_id__in={s.assessment_id for s in submissions},
+                question_type="MULTIPLE_CHOICE",
+            )
+            .order_by()
+            .values("assessment")
+            .annotate(total=Sum("points"))
+        }
 
         data = []
 
-        for submission in queryset:
+        for submission in submissions:
             student = submission.student
             assessment = submission.assessment
 
             data.append({
                 "id": submission.id,
+                "student_pk": student.id,
                 "assessment_id": assessment.id,
                 "assessment_title": assessment.title,
                 "classroom_id": assessment.classroom_id,
@@ -1323,6 +1345,7 @@ class SubmissionListView(APIView):
                     if submission.approved_score is not None
                     else None
                 ),
+                "total_points": str(totals.get(assessment.id, 0)),
                 "approved_by": (
                     submission.approved_by.username
                     if submission.approved_by

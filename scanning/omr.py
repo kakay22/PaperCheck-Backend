@@ -54,22 +54,13 @@ def _circle_dark_ratio(gray, center_x, center_y, radius):
     return float(np.mean(pixels < DARK_PIXEL_THRESHOLD))
 
 
+
 def detect_answers(image_path, assessment, page_index=0):
     """
-    Detect shaded bubbles on a flat, upright image of a generated
-    PaperCheck A4 answer sheet.
+    Detect and grade multiple-choice answers on one answer-sheet page.
 
-    page_index is zero-based: first page = 0.
-
-    Bubble positions come from scanning/layout.py, which the PDF
-    generator also imports. Do not hard-code grid positions here.
-
-    This initial version assumes:
-    - the entire A4 page is visible;
-    - the page is upright and not perspective-distorted;
-    - the image corresponds to the current answer-sheet layout.
-
-    It does not yet process PDFs or correct perspective distortion.
+    Returns per-question answer status, correct option, selected option,
+    points earned, and a score summary for this page.
     """
     image = cv2.imread(str(image_path))
 
@@ -84,18 +75,17 @@ def detect_answers(image_path, assessment, page_index=0):
         raise ValueError(
             "Image resolution is too low for reliable bubble detection."
         )
-    
-    # Straighten the photo using the four corner markers. After this the
-    # image is exactly page-shaped, so the code below is unchanged.
+
     image = align_page(image)
     height, width = image.shape[:2]
-
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # Map PDF points to pixels. This assumes the whole page is visible.
     scale_x = width / PAGE_WIDTH
     scale_y = height / PAGE_HEIGHT
-    bubble_radius = max(2, int(BUBBLE_RADIUS * min(scale_x, scale_y)))
+    bubble_radius = max(
+        2,
+        int(BUBBLE_RADIUS * min(scale_x, scale_y)),
+    )
 
     questions = list(
         assessment.questions
@@ -110,6 +100,13 @@ def detect_answers(image_path, assessment, page_index=0):
     ]
 
     results = []
+    correct_count = 0
+    wrong_count = 0
+    blank_count = 0
+    duplicate_count = 0
+    uncertain_count = 0
+    points_earned = 0.0
+    possible_points = 0.0
 
     for row_index, question in enumerate(page_questions):
         options = list(question.options.all().order_by("label"))
@@ -130,6 +127,7 @@ def detect_answers(image_path, assessment, page_index=0):
             option_results.append({
                 "label": option.label,
                 "dark_ratio": round(ratio, 3),
+                "is_correct": bool(option.is_correct),
             })
 
         ranked = sorted(
@@ -146,38 +144,82 @@ def detect_answers(image_path, assessment, page_index=0):
 
         selected_option = None
         confidence = None
+        points = float(question.points)
+        earned = 0.0
+
+        correct_options = [
+            option["label"]
+            for option in option_results
+            if option["is_correct"]
+        ]
+        correct_option = correct_options[0] if len(correct_options) == 1 else None
 
         if not marked:
-            answer_status = "BLANK"
+            status = "BLANK"
+            blank_count += 1
 
         elif len(marked) > 1:
-            answer_status = "MULTIPLE_MARKS"
+            status = "MULTIPLE_MARKS"
+            duplicate_count += 1
 
         else:
             top = ranked[0]
-            second_ratio = ranked[1]["dark_ratio"] if len(ranked) > 1 else 0.0
+            second_ratio = (
+                ranked[1]["dark_ratio"] if len(ranked) > 1 else 0.0
+            )
             gap = top["dark_ratio"] - second_ratio
 
             if gap < MIN_CONFIDENCE_GAP:
-                answer_status = "UNCERTAIN"
+                status = "UNCERTAIN"
+                uncertain_count += 1
             else:
-                answer_status = "DETECTED"
                 selected_option = top["label"]
                 confidence = round(min(1.0, gap), 3)
+
+                if correct_option is None:
+                    status = "UNCERTAIN"
+                    uncertain_count += 1
+                elif selected_option == correct_option:
+                    status = "CORRECT"
+                    earned = points
+                    correct_count += 1
+                else:
+                    status = "WRONG"
+                    wrong_count += 1
+
+        points_earned += earned
+        possible_points += points
 
         results.append({
             "question_id": question.id,
             "question_number": question.order,
-            "status": answer_status,
+            "status": status,
             "selected_option": selected_option,
+            "correct_option": correct_option,
             "confidence": confidence,
+            "points_earned": round(earned, 2),
+            "points_possible": round(points, 2),
             "options": option_results,
         })
+
+    percentage = (
+        round((points_earned / possible_points) * 100, 2)
+        if possible_points > 0
+        else 0.0
+    )
 
     return {
         "assessment_id": assessment.id,
         "page_index": page_index,
         "questions_processed": len(results),
+        "score": round(points_earned, 2),
+        "possible_points": round(possible_points, 2),
+        "percentage": percentage,
+        "correct_count": correct_count,
+        "wrong_count": wrong_count,
+        "blank_count": blank_count,
+        "duplicate_count": duplicate_count,
+        "uncertain_count": uncertain_count,
         "answers": results,
     }
 
