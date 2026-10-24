@@ -17,6 +17,10 @@ from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.db.models import Sum
 
+from assessments.models import Question
+from grading.models import Submission, StudentAnswer
+from grading.enumeration import score_enumeration_answer, split_student_answers
+
 from schools.models import Enrollment, Student
 from grading.models import Submission, GradeAuditLog, StudentAnswer
 
@@ -234,9 +238,6 @@ class ScanJobViewSet(viewsets.ReadOnlyModelViewSet):
             assessment__classroom__teacher=user
         )
 
-
-
-
 class ScanFileProcessView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -279,6 +280,75 @@ class ScanFileProcessView(APIView):
 
         if extension not in {".jpg", ".jpeg", ".png", ".webp", ".pdf"}:
             raise ValidationError("Unsupported file format.")
+
+        
+        # Enumeration-only assessments use ordinary paper photos.
+        # They must not pass through the corner-marker OMR detector.
+        has_multiple_choice = assessment.questions.filter(
+            question_type="MULTIPLE_CHOICE"
+        ).exists()
+
+        has_enumeration = assessment.questions.filter(
+            question_type="ENUMERATION"
+        ).exists()
+
+        if not has_multiple_choice and has_enumeration:
+            print("ASSESSMENT:", assessment.id, assessment.title)
+            print("HAS MULTIPLE CHOICE:", has_multiple_choice)
+            print("HAS ENUMERATION:", has_enumeration)
+            if extension not in {".jpg", ".jpeg", ".png", ".webp"}:
+                raise ValidationError(
+                    "Enumeration photo review supports JPG, PNG, and WebP "
+                    "images. Upload a photo of the handwritten answer paper."
+                )
+
+            with transaction.atomic():
+                locked_file = ScanFile.objects.select_for_update().get(
+                    pk=scan_file.pk
+                )
+
+                if locked_file.status in {
+                    ScanFile.Status.PROCESSING,
+                    ScanFile.Status.COMPLETED,
+                    ScanFile.Status.NEEDS_REVIEW,
+                }:
+                    raise ValidationError(
+                        "This file is already processing or awaiting review."
+                    )
+
+                locked_file.status = ScanFile.Status.NEEDS_REVIEW
+                locked_file.error_message = ""
+                locked_file.save(
+                    update_fields=["status", "error_message"]
+                )
+
+                ScanJob.objects.filter(pk=job.pk).update(
+                    status=ScanJob.Status.PROCESSING,
+                    error_message="",
+                    completed_at=None,
+                )
+
+            return Response(
+                {
+                    "message": (
+                        "Photo uploaded for enumeration teacher review."
+                    ),
+                    "enumeration_review": True,
+                    "scan_file_id": scan_file.id,
+                    "scan_job_id": str(job.id),
+                    "filename": scan_file.original_filename,
+                    "image_url": request.build_absolute_uri(
+                        scan_file.file.url
+                    ),
+                    "answers": [],
+                    "questions_processed": 0,
+                    "correct_count": 0,
+                    "detected_student_id": "",
+                    "suggested_student": None,
+                },
+                status=http_status.HTTP_200_OK,
+            )
+
 
         questions = list(
             assessment.questions.filter(question_type="MULTIPLE_CHOICE")
@@ -579,9 +649,10 @@ class ScanFileProcessView(APIView):
             ]
         )
 
+
 class ScanFileResultsView(APIView):
     """
-    Return the detected answers for one uploaded scan.
+    Return detected scan answers and enumeration questions.
     Only the assigned teacher or a school administrator may view them.
     """
     permission_classes = [IsAuthenticated]
@@ -605,10 +676,8 @@ class ScanFileResultsView(APIView):
                 scan_job__assessment__classroom__teacher=user
             )
 
-        scan_file = get_object_or_404(
-            queryset,
-            pk=scan_file_id,
-        )
+        scan_file = get_object_or_404(queryset, pk=scan_file_id)
+        assessment = scan_file.scan_job.assessment
 
         results = (
             ScanResult.objects
@@ -640,29 +709,109 @@ class ScanFileResultsView(APIView):
                 ],
             })
 
-        unreviewed = [item for item in data if not item["reviewed"]]
+        unreviewed = [
+            item for item in data if not item["reviewed"]
+        ]
         needs_attention = [
-            item for item in unreviewed if item["status"] != "DETECTED"
+            item
+            for item in unreviewed
+            if item["status"] != "DETECTED"
         ]
 
         suggested = find_student_by_id(
-            scan_file.scan_job.assessment,
+            assessment,
             scan_file.detected_student_id,
         )
 
         correct_map = dict(
             QuestionOption.objects.filter(
-                question__assessment=scan_file.scan_job.assessment,
+                question__assessment=assessment,
                 is_correct=True,
             ).values_list("question_id", "label")
         )
+
         correct_count = sum(
             1
             for item in data
             if item["selected_label"]
-            and correct_map.get(item["question_id"]) == item["selected_label"]
+            and correct_map.get(item["question_id"])
+            == item["selected_label"]
         )
-        blank_count = sum(1 for item in data if item["status"] == "BLANK")
+
+        blank_count = sum(
+            1 for item in data if item["status"] == "BLANK"
+        )
+
+        # If a submission already exists, return its saved enumeration
+        # answers so the teacher can continue reviewing them.
+        from grading.models import Submission, StudentAnswer
+
+        submission = None
+        enumeration_answers_by_question = {}
+
+        if scan_file.matched_student_id:
+            submission = Submission.objects.filter(
+                assessment=assessment,
+                student_id=scan_file.matched_student_id,
+            ).first()
+
+        if submission:
+            enumeration_answers_by_question = {
+                answer.question_id: answer
+                for answer in StudentAnswer.objects.filter(
+                    submission=submission,
+                    question__question_type="ENUMERATION",
+                ).select_related("question")
+            }
+
+        enumeration_questions = []
+
+        questions = (
+            assessment.questions
+            .filter(question_type="ENUMERATION")
+            .prefetch_related("key_items")
+            .order_by("order")
+        )
+
+        for question in questions:
+            saved_answer = enumeration_answers_by_question.get(
+                question.id
+            )
+
+            saved_items = (
+                saved_answer.extracted_text.splitlines()
+                if saved_answer
+                else []
+            )
+
+            enumeration_questions.append({
+                "id": question.id,
+                "order": question.order,
+                "prompt": question.prompt,
+                "item_count": question.enum_item_count,
+                "ordered": question.enum_ordered,
+                "points": str(question.points),
+                "points_per_item": (
+                    str(question.enum_points_per_item)
+                    if question.enum_points_per_item is not None
+                    else None
+                ),
+                "saved_answers": saved_items,
+                "awarded_points": (
+                    str(saved_answer.awarded_points)
+                    if saved_answer
+                    and saved_answer.awarded_points is not None
+                    else None
+                ),
+                "is_correct": (
+                    saved_answer.is_correct
+                    if saved_answer
+                    else None
+                ),
+                "student_answer_id": (
+                    saved_answer.id if saved_answer else None
+                ),
+            })
 
         return Response({
             "scan_file_id": scan_file.id,
@@ -673,7 +822,10 @@ class ScanFileResultsView(APIView):
             "suggested_student": (
                 {
                     "student_id": suggested.student_id,
-                    "name": f"{suggested.first_name} {suggested.last_name}",
+                    "name": (
+                        f"{suggested.first_name} "
+                        f"{suggested.last_name}"
+                    ),
                 }
                 if suggested
                 else None
@@ -685,7 +837,12 @@ class ScanFileResultsView(APIView):
             "unreviewed_count": len(unreviewed),
             "needs_attention_count": len(needs_attention),
             "results": data,
+            "submission_id": (
+                submission.id if submission else None
+            ),
+            "enumeration_questions": enumeration_questions,
         })
+
 
 
 class ScanResultReviewView(APIView):
@@ -887,6 +1044,7 @@ class ScanFilePreviewView(APIView):
 
         return HttpResponse(jpeg, content_type="image/jpeg")
 
+
 class ScanFileGradeView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -965,22 +1123,23 @@ class ScanFileGradeView(APIView):
                 status=status.HTTP_409_CONFLICT,
             )
 
-        questions = list(
-            assessment.questions.filter(
-                question_type="MULTIPLE_CHOICE"
-            ).order_by("order")
+        # Keep every question for the overall possible score.
+        all_questions = list(
+            assessment.questions.all().order_by("order")
         )
 
-        if not questions:
+        if not all_questions:
             return Response(
-                {
-                    "message": (
-                        "This assessment has no multiple-choice questions "
-                        "to grade with OMR."
-                    )
-                },
+                {"message": "This assessment has no questions to grade."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # OMR results are only required for multiple-choice questions.
+        mc_questions = [
+            question
+            for question in all_questions
+            if question.question_type == "MULTIPLE_CHOICE"
+        ]
 
         results_by_question = {
             result.question_id: result
@@ -992,13 +1151,13 @@ class ScanFileGradeView(APIView):
 
         missing = [
             question.order
-            for question in questions
+            for question in mc_questions
             if question.id not in results_by_question
         ]
 
         unreviewed = [
             question.order
-            for question in questions
+            for question in mc_questions
             if (
                 question.id in results_by_question
                 and not results_by_question[question.id].reviewed
@@ -1028,7 +1187,11 @@ class ScanFileGradeView(APIView):
                     and locked_file.matched_student_id != student.id
                 ):
                     return Response(
-                        {"message": "This scan is matched to another student."},
+                        {
+                            "message": (
+                                "This scan is matched to another student."
+                            )
+                        },
                         status=status.HTTP_409_CONFLICT,
                     )
 
@@ -1053,13 +1216,13 @@ class ScanFileGradeView(APIView):
                         status=status.HTTP_409_CONFLICT,
                     )
 
-                score = Decimal("0.00")
-                correct_count = 0
-                answer_count = 0
-
-                for question in questions:
+                # Regrade multiple-choice answers without touching
+                # previously saved enumeration or other question answers.
+                for question in mc_questions:
                     result = results_by_question[question.id]
-                    selected_label = result.selected_label.strip().upper()
+                    selected_label = (
+                        result.selected_label or ""
+                    ).strip().upper()
 
                     selected_option = None
 
@@ -1096,11 +1259,20 @@ class ScanFileGradeView(APIView):
                         },
                     )
 
-                    score += awarded_points
-                    answer_count += 1
+                # Recalculate using every saved answer, including
+                # enumeration answers scored through the enumeration API.
+                saved_points = StudentAnswer.objects.filter(
+                    submission=submission
+                ).values_list("awarded_points", flat=True)
 
-                    if is_correct:
-                        correct_count += 1
+                score = sum(
+                    (
+                        points if points is not None
+                        else Decimal("0.00")
+                        for points in saved_points
+                    ),
+                    Decimal("0.00"),
+                )
 
                 submission.scan_job = scan_file.scan_job
                 submission.original_file = scan_file.file.name
@@ -1118,6 +1290,23 @@ class ScanFileGradeView(APIView):
                 locked_file.matched_student = student
                 locked_file.save(update_fields=["matched_student"])
 
+                answer_count = StudentAnswer.objects.filter(
+                    submission=submission
+                ).count()
+
+                correct_count = StudentAnswer.objects.filter(
+                    submission=submission,
+                    is_correct=True,
+                ).count()
+
+                total_possible = sum(
+                    (
+                        question.points
+                        for question in all_questions
+                    ),
+                    Decimal("0.00"),
+                )
+
             return Response(
                 {
                     "message": (
@@ -1133,9 +1322,7 @@ class ScanFileGradeView(APIView):
                     "answers_graded": answer_count,
                     "correct_answers": correct_count,
                     "total_points_earned": str(score),
-                    "total_points_possible": str(
-                        sum(question.points for question in questions)
-                    ),
+                    "total_points_possible": str(total_possible),
                     "status": submission.status,
                     "approved": False,
                 },
@@ -1147,6 +1334,142 @@ class ScanFileGradeView(APIView):
                 {"message": str(exc)},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+
+
+class ScanFileEnumerationReviewView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, scan_file_id):
+        user = request.user
+        is_admin = (
+            user.is_superuser
+            or getattr(user, "role", "") == "SCHOOL_ADMIN"
+        )
+
+        queryset = ScanFile.objects.select_related(
+            "scan_job",
+            "scan_job__assessment",
+            "scan_job__assessment__classroom",
+        )
+
+        if not is_admin:
+            queryset = queryset.filter(
+                scan_job__assessment__classroom__teacher=user
+            )
+
+        scan_file = get_object_or_404(queryset, pk=scan_file_id)
+        assessment = scan_file.scan_job.assessment
+
+        if assessment.status != "PUBLISHED":
+            raise ValidationError(
+                "Only published assessments can receive submissions."
+            )
+
+        if scan_file.status != ScanFile.Status.NEEDS_REVIEW:
+            raise ValidationError(
+                "Process this enumeration photo before reviewing it."
+            )
+
+        if not assessment.questions.filter(
+            question_type="ENUMERATION"
+        ).exists():
+            raise ValidationError(
+                "This assessment has no enumeration questions."
+            )
+
+        if assessment.questions.filter(
+            question_type="MULTIPLE_CHOICE"
+        ).exists():
+            raise ValidationError(
+                "This endpoint is for enumeration-only assessments."
+            )
+
+        student_id = request.data.get("student_id")
+
+        if not student_id:
+            raise ValidationError(
+                {"student_id": "Select a student for this paper."}
+            )
+
+        student = get_object_or_404(
+            Student,
+            pk=student_id,
+            school_id=assessment.classroom.school_id,
+            is_active=True,
+        )
+
+        # Prevent the same student from receiving duplicate submissions.
+        if Submission.objects.filter(
+            assessment=assessment,
+            student=student,
+        ).exists():
+            return Response(
+                {
+                    "detail": (
+                        "This student already has a submission for "
+                        "this assessment."
+                    )
+                },
+                status=http_status.HTTP_409_CONFLICT,
+            )
+
+        with transaction.atomic():
+            locked_file = ScanFile.objects.select_for_update().get(
+                pk=scan_file.pk
+            )
+
+            if locked_file.status != ScanFile.Status.NEEDS_REVIEW:
+                raise ValidationError(
+                    "This photo has already been assigned for review."
+                )
+
+            # Recheck inside the transaction to reduce duplicate submissions.
+            if Submission.objects.filter(
+                assessment=assessment,
+                student=student,
+            ).exists():
+                return Response(
+                    {
+                        "detail": (
+                            "This student already has a submission "
+                            "for this assessment."
+                        )
+                    },
+                    status=http_status.HTTP_409_CONFLICT,
+                )
+
+            submission = Submission.objects.create(
+                assessment=assessment,
+                student=student,
+                scan_job=locked_file.scan_job,
+                # Reuse the uploaded file instead of copying it.
+                original_file=locked_file.file.name,
+                status=Submission.Status.NEEDS_REVIEW,
+            )
+
+            locked_file.matched_student = student
+            locked_file.save(update_fields=["matched_student"])
+
+        return Response(
+            {
+                "message": "Student matched. Enter the handwritten answers.",
+                "submission_id": submission.id,
+                "scan_file_id": scan_file.id,
+                "student": {
+                    "id": student.id,
+                    "student_id": student.student_id,
+                    "name": (
+                        f"{student.first_name} {student.last_name}"
+                    ).strip(),
+                },
+                "image_url": request.build_absolute_uri(
+                    scan_file.file.url
+                ),
+                "status": submission.status,
+            },
+            status=http_status.HTTP_201_CREATED,
+        )
 
 
 class SubmissionApproveView(APIView):
@@ -1439,3 +1762,212 @@ class SubmissionAuditHistoryView(APIView):
             "history_count": len(history),
             "history": history,
         })
+
+
+class SubmissionEnumerationAnswersView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, submission_id):
+        submission = get_object_or_404(
+            Submission.objects.select_related(
+                "assessment",
+                "assessment__created_by",
+            ),
+            pk=submission_id,
+        )
+
+        user = request.user
+        role = getattr(user, "role", "")
+
+        is_admin = user.is_superuser or role == "SCHOOL_ADMIN"
+        is_owner = submission.assessment.created_by_id == user.id
+
+        if not (is_admin or is_owner):
+            return Response(
+                {"detail": "You do not have permission to grade this submission."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if submission.status == Submission.Status.APPROVED:
+            return Response(
+                {"detail": "This submission is already approved."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        question_id = request.data.get("question_id")
+        answers = request.data.get("answers")
+
+        if question_id is None:
+            return Response(
+                {"question_id": "This field is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if answers is None:
+            return Response(
+                {"answers": "Provide the student's answers."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        question = get_object_or_404(
+            Question,
+            pk=question_id,
+            assessment_id=submission.assessment_id,
+            question_type=Question.Type.ENUMERATION,
+        )
+
+        try:
+            result = score_enumeration_answer(question, answers)
+        except ValueError as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Store the entered/OCR-extracted answers and score atomically.
+        with transaction.atomic():
+            normalized_answers = split_student_answers(answers)
+
+            student_answer, _ = StudentAnswer.objects.update_or_create(
+                submission=submission,
+                question=question,
+                defaults={
+                    "extracted_text": "\n".join(normalized_answers),
+                    "is_correct": result["is_correct"],
+                    "awarded_points": result["earned_points"],
+                    "review_status": StudentAnswer.ReviewStatus.PENDING,
+                },
+            )
+
+            # Recalculate the submission score using all saved answers.
+            # Unreviewed answers are included as provisional scores.
+            total_score = sum(
+                (
+                    answer.awarded_points or Decimal("0.00")
+                    for answer in StudentAnswer.objects.filter(
+                        submission=submission
+                    )
+                ),
+                Decimal("0.00"),
+            )
+
+            submission.score = total_score
+            submission.status = Submission.Status.NEEDS_REVIEW
+            submission.save(update_fields=["score", "status"])
+
+            submission.score = total_score
+            submission.status = Submission.Status.NEEDS_REVIEW
+            submission.save(update_fields=["score", "status"])
+
+        result["student_answer_id"] = student_answer.id
+        result["submission_id"] = submission.id
+        result["submission_score"] = str(submission.score)
+
+        return Response(result, status=status.HTTP_200_OK)
+
+
+
+from decimal import Decimal
+
+from django.db import transaction
+from django.shortcuts import get_object_or_404
+
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from grading.enumeration import (
+    score_enumeration_answer,
+    split_student_answers,
+)
+from grading.models import StudentAnswer, Submission
+
+
+class EnumerationAnswerReviewView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, submission_id, answer_id):
+        submission = get_object_or_404(
+            Submission.objects.select_related("assessment"),
+            pk=submission_id,
+        )
+
+        user = request.user
+        role = getattr(user, "role", "")
+        is_admin = user.is_superuser or role == "SCHOOL_ADMIN"
+        is_owner = submission.assessment.created_by_id == user.id
+
+        if not (is_admin or is_owner):
+            return Response(
+                {"detail": "You do not have permission to review this submission."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if submission.status == "APPROVED":
+            return Response(
+                {"detail": "This submission has already been approved."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        student_answer = get_object_or_404(
+            StudentAnswer.objects.select_related("question"),
+            pk=answer_id,
+            submission=submission,
+            question__question_type="ENUMERATION",
+        )
+
+        if "answers" not in request.data:
+            return Response(
+                {"answers": "Provide the corrected answers."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            answers = split_student_answers(request.data["answers"])
+            result = score_enumeration_answer(
+                student_answer.question,
+                answers,
+            )
+        except ValueError as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            student_answer.extracted_text = "\n".join(answers)
+            student_answer.is_correct = result["is_correct"]
+            student_answer.awarded_points = Decimal(
+                result["earned_points"]
+            )
+            student_answer.review_status = "CORRECTED"
+            student_answer.save(
+                update_fields=[
+                    "extracted_text",
+                    "is_correct",
+                    "awarded_points",
+                    "review_status",
+                ]
+            )
+
+            total_score = sum(
+                (
+                    answer.awarded_points or Decimal("0.00")
+                    for answer in StudentAnswer.objects.filter(
+                        submission=submission
+                    )
+                ),
+                Decimal("0.00"),
+            )
+
+            submission.score = total_score
+            submission.status = "NEEDS_REVIEW"
+            submission.save(update_fields=["score", "status"])
+
+        result["student_answer_id"] = student_answer.id
+        result["submission_id"] = submission.id
+        result["submission_score"] = str(submission.score)
+        result["review_status"] = student_answer.review_status
+
+        return Response(result, status=status.HTTP_200_OK)

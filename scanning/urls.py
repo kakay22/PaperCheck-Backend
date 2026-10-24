@@ -4,6 +4,7 @@ from rest_framework.routers import DefaultRouter
 
 from .views import (
     AnswerSheetDownloadView,
+    EnumerationAnswerReviewView,
     ScanUploadView,
     ScanJobViewSet,
     ScanFileConfirmDetectedView,
@@ -15,6 +16,8 @@ from .views import (
     SubmissionApproveView,
     SubmissionListView,
     SubmissionAuditHistoryView,
+    SubmissionEnumerationAnswersView,
+    ScanFileEnumerationReviewView
 )
 
 router = DefaultRouter()
@@ -80,6 +83,24 @@ urlpatterns = [
         "submissions/<int:submission_id>/audit-history/",
         SubmissionAuditHistoryView.as_view(),
         name="submission-audit-history",
+    ),
+
+    path(
+        "submissions/<int:submission_id>/enumeration-answers/",
+        SubmissionEnumerationAnswersView.as_view(),
+        name="submission-enumeration-answers",
+    ),
+
+    path(
+        "submissions/<int:submission_id>/answers/<int:answer_id>/review/",
+        EnumerationAnswerReviewView.as_view(),
+        name="enumeration-answer-review",
+    ),
+
+    path(
+        "scan-files/<int:scan_file_id>/enumeration-review/",
+        ScanFileEnumerationReviewView.as_view(),
+        name="scan-file-enumeration-review",
     ),
 
     # Scan job listing

@@ -62,6 +62,12 @@ class Question(models.Model):
     points = models.DecimalField(max_digits=7, decimal_places=2, default=1)
     required = models.BooleanField(default=True)
 
+    enum_ordered = models.BooleanField(default=False)
+    enum_item_count = models.PositiveSmallIntegerField(null=True, blank=True)
+    enum_points_per_item = models.DecimalField(
+        max_digits=6, decimal_places=2, null=True, blank=True
+    )
+
     class Meta:
         ordering = ["order"]
         constraints = [
@@ -96,3 +102,25 @@ class QuestionOption(models.Model):
 
     def __str__(self):
         return f"{self.question} - {self.label}"
+
+class EnumerationKeyItem(models.Model):
+    question = models.ForeignKey(
+        Question,
+        on_delete=models.CASCADE,
+        related_name="key_items",
+    )
+    position = models.PositiveSmallIntegerField()
+    # Accepted spellings for this item, e.g. ["mitochondria", "mitochondrion"]
+    variants = models.JSONField(default=list)
+
+    class Meta:
+        ordering = ["position"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["question", "position"],
+                name="unique_key_item_position_per_question",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.question} - item {self.position}"

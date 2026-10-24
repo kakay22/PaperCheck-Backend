@@ -95,6 +95,23 @@ class AssessmentViewSet(viewsets.ModelViewSet):
                         f"Question {question.order}: mark exactly one correct option."
                     )
 
+            if question.question_type == "ENUMERATION":
+                count = question.enum_item_count or 0
+                keys = question.key_items.count()
+
+                if count < 1 or not question.enum_points_per_item:
+                    errors.append(
+                        f"Question {question.order}: set the item count and points per item."
+                    )
+                elif question.enum_ordered and keys != count:
+                    errors.append(
+                        f"Question {question.order}: an ordered list needs exactly {count} answers."
+                    )
+                elif keys < count:
+                    errors.append(
+                        f"Question {question.order}: add at least {count} accepted answers."
+                    )
+
             if question.points <= 0:
                 errors.append(
                     f"Question {question.order}: points must be greater than zero."

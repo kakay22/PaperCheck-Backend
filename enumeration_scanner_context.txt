@@ -1,0 +1,3424 @@
+PAPERCHECK ENUMERATION SCANNER CONTEXT
+Project root: C:\Users\hicco\OneDrive\Desktop\PROJECTS\PAPERCHECK\PaperCheck-Backend
+
+
+==========================================================================================
+FILE: assessments/models.py
+==========================================================================================
+from django.conf import settings
+from django.db import models
+
+
+class Assessment(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "DRAFT", "Draft"
+        PUBLISHED = "PUBLISHED", "Published"
+        CLOSED = "CLOSED", "Closed"
+
+    classroom = models.ForeignKey(
+        "schools.Classroom",
+        on_delete=models.PROTECT,
+        related_name="assessments",
+    )
+    title = models.CharField(max_length=200)
+    instructions = models.TextField(blank=True)
+    description = models.TextField(blank=True)
+    status = models.CharField(
+        max_length=12,
+        choices=Status.choices,
+        default=Status.DRAFT,
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="created_assessments",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return self.title
+
+    @property
+    def total_points(self):
+        return sum(question.points for question in self.questions.all())
+
+
+class Question(models.Model):
+    class Type(models.TextChoices):
+        MULTIPLE_CHOICE = "MULTIPLE_CHOICE", "Multiple Choice"
+        ENUMERATION = "ENUMERATION", "Enumeration"
+        SHORT_ANSWER = "SHORT_ANSWER", "Short Answer"
+        ESSAY = "ESSAY", "Essay"
+
+    assessment = models.ForeignKey(
+        Assessment,
+        on_delete=models.CASCADE,
+        related_name="questions",
+    )
+    question_type = models.CharField(
+        max_length=20,
+        choices=Type.choices,
+        default=Type.MULTIPLE_CHOICE,
+    )
+    prompt = models.TextField()
+    order = models.PositiveIntegerField()
+    points = models.DecimalField(max_digits=7, decimal_places=2, default=1)
+    required = models.BooleanField(default=True)
+
+    enum_ordered = models.BooleanField(default=False)
+    enum_item_count = models.PositiveSmallIntegerField(null=True, blank=True)
+    enum_points_per_item = models.DecimalField(
+        max_digits=6, decimal_places=2, null=True, blank=True
+    )
+
+    class Meta:
+        ordering = ["order"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["assessment", "order"],
+                name="unique_question_order_per_assessment",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.assessment.title} - Question {self.order}"
+
+
+class QuestionOption(models.Model):
+    question = models.ForeignKey(
+        Question,
+        on_delete=models.CASCADE,
+        related_name="options",
+    )
+    label = models.CharField(max_length=5)
+    text = models.CharField(max_length=500)
+    is_correct = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ["label"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["question", "label"],
+                name="unique_option_label_per_question",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.question} - {self.label}"
+
+class EnumerationKeyItem(models.Model):
+    question = models.ForeignKey(
+        Question,
+        on_delete=models.CASCADE,
+        related_name="key_items",
+    )
+    position = models.PositiveSmallIntegerField()
+    # Accepted spellings for this item, e.g. ["mitochondria", "mitochondrion"]
+    variants = models.JSONField(default=list)
+
+    class Meta:
+        ordering = ["position"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["question", "position"],
+                name="unique_key_item_position_per_question",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.question} - item {self.position}"
+
+==========================================================================================
+FILE: assessments/serializers.py
+==========================================================================================
+from rest_framework import serializers
+from .models import Assessment, EnumerationKeyItem, Question, QuestionOption
+
+
+class QuestionOptionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = QuestionOption
+        fields = ["id", "label", "text", "is_correct"]
+        read_only_fields = ["id"]
+
+
+class EnumerationKeyItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EnumerationKeyItem
+        fields = ["id", "position", "variants"]
+        read_only_fields = ["id"]
+
+    def validate_variants(self, value):
+        if not isinstance(value, list) or not value:
+            raise serializers.ValidationError("Provide at least one accepted answer.")
+
+        cleaned = []
+        seen = set()
+        for variant in value:
+            if not isinstance(variant, str) or not variant.strip():
+                raise serializers.ValidationError("Answers must be non-empty text.")
+            text = " ".join(variant.split())
+            if text.lower() in seen:
+                continue
+            seen.add(text.lower())
+            cleaned.append(text)
+        return cleaned
+
+class QuestionSerializer(serializers.ModelSerializer):
+    options = QuestionOptionSerializer(many=True, required=False)
+
+    key_items = EnumerationKeyItemSerializer(many=True, required=False)
+
+    class Meta:
+        model = Question
+        fields = [
+            "id", "assessment", "question_type",
+            "prompt", "order", "points", "required", "options",
+            "enum_ordered", "enum_item_count", "enum_points_per_item",
+            "key_items",
+        ]
+        read_only_fields = ["id"]
+
+    def validate(self, attrs):
+        question_type = attrs.get(
+            "question_type",
+            getattr(self.instance, "question_type", None),
+        )
+        options = attrs.get("options")
+        
+
+        if question_type == Question.Type.MULTIPLE_CHOICE:
+            if self.instance is None and options is None:
+                raise serializers.ValidationError({
+                    "options": "Provide answer choices for a new multiple-choice question."
+                })
+
+            if options is not None:
+                labels = [option["label"] for option in options]
+
+                if len(labels) < 2:
+                    raise serializers.ValidationError({
+                        "options": "Provide at least two choices."
+                    })
+
+                if len(labels) != len(set(labels)):
+                    raise serializers.ValidationError({
+                        "options": "Choice labels must be unique."
+                    })
+
+                if sum(bool(option.get("is_correct")) for option in options) != 1:
+                    raise serializers.ValidationError({
+                        "options": "Exactly one choice must be marked correct."
+                    })
+
+                if question_type == Question.Type.ENUMERATION:
+                    def current(name, default=None):
+                        return attrs.get(name, getattr(self.instance, name, default))
+
+                    count = current("enum_item_count")
+                    per_item = current("enum_points_per_item")
+                    ordered = current("enum_ordered", False)
+                    key_items = attrs.get("key_items")
+
+                    if not count or not 1 <= count <= 20:
+                        raise serializers.ValidationError({
+                            "enum_item_count": "Enter how many items students must list (1 to 20)."
+                        })
+
+                    if per_item is None or per_item <= 0:
+                        raise serializers.ValidationError({
+                            "enum_points_per_item": "Points per item must be greater than zero."
+                        })
+
+                    if key_items is None:
+                        if self.instance is None:
+                            raise serializers.ValidationError({
+                                "key_items": "Provide the accepted answers."
+                            })
+                        key_count = self.instance.key_items.count()
+                    else:
+                        key_count = len(key_items)
+
+                        positions = [item["position"] for item in key_items]
+                        if len(positions) != len(set(positions)):
+                            raise serializers.ValidationError({
+                                "key_items": "Each answer needs a unique position."
+                            })
+
+                        if not ordered:
+                            seen = {}
+                            for item in key_items:
+                                for variant in item["variants"]:
+                                    key = variant.lower()
+                                    if key in seen and seen[key] != item["position"]:
+                                        raise serializers.ValidationError({
+                                            "key_items": (
+                                                f'"{variant}" is listed under two different items.'
+                                            )
+                                        })
+                                    seen[key] = item["position"]
+
+                    if ordered and key_count != count:
+                        raise serializers.ValidationError({
+                            "key_items": f"An ordered list needs exactly {count} answers."
+                        })
+                    if not ordered and key_count < count:
+                        raise serializers.ValidationError({
+                            "key_items": f"Provide at least {count} accepted answers."
+                        })
+
+                    # Question points follow from the item settings.
+                    attrs["points"] = count * per_item
+
+        return attrs
+
+    def create(self, validated_data):
+        options_data = validated_data.pop("options", [])
+        key_items_data = validated_data.pop("key_items", [])
+
+        # Calculate enumeration points automatically.
+        if validated_data.get("question_type") == "ENUMERATION":
+            count = validated_data.get("enum_item_count")
+            per_item = validated_data.get("enum_points_per_item")
+
+            if count is not None and per_item is not None:
+                validated_data["points"] = count * per_item
+
+        question = Question.objects.create(**validated_data)
+
+        for item in key_items_data:
+            EnumerationKeyItem.objects.create(
+                question=question,
+                **item,
+            )
+
+        for option in options_data:
+            QuestionOption.objects.create(
+                question=question,
+                **option,
+            )
+
+        return question
+    
+    def update(self, instance, validated_data):
+        options_data = validated_data.pop("options", None)
+        key_items_data = validated_data.pop("key_items", None)
+
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+
+        # Recalculate enumeration points when updating a question.
+        if instance.question_type == "ENUMERATION":
+            count = instance.enum_item_count
+            per_item = instance.enum_points_per_item
+
+            if count is not None and per_item is not None:
+                instance.points = count * per_item
+
+        instance.save()
+
+        if options_data is not None:
+            instance.options.all().delete()
+
+            for option in options_data:
+                QuestionOption.objects.create(
+                    question=instance,
+                    **option,
+                )
+
+        if key_items_data is not None:
+            instance.key_items.all().delete()
+
+            for item in key_items_data:
+                EnumerationKeyItem.objects.create(
+                    question=instance,
+                    **item,
+                )
+
+        return instance
+
+
+
+class AssessmentSerializer(serializers.ModelSerializer):
+    classroom_name = serializers.CharField(
+        source="classroom.name",
+        read_only=True,
+    )
+    created_by_username = serializers.CharField(
+        source="created_by.username",
+        read_only=True,
+    )
+    total_points = serializers.DecimalField(
+        max_digits=9,
+        decimal_places=2,
+        read_only=True,
+    )
+    question_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Assessment
+        fields = [
+            "id", "classroom", "classroom_name",
+            "title", "instructions", "description", "status",
+            "created_by", "created_by_username",
+            "created_at", "updated_at", "total_points",
+            "question_count",
+        ]
+        read_only_fields = [
+            "id",
+            "created_by",
+            "created_at",
+            "updated_at",
+            "status",
+        ]
+
+    def get_question_count(self, obj):
+        return obj.questions.count()
+
+==========================================================================================
+FILE: assessments/views.py
+==========================================================================================
+from rest_framework import viewsets
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.exceptions import PermissionDenied
+
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.exceptions import ValidationError, PermissionDenied
+
+from .models import Assessment, Question, QuestionOption
+
+from schools.views import is_school_admin
+from .models import Assessment, Question
+from .serializers import AssessmentSerializer, QuestionSerializer
+
+
+class AssessmentViewSet(viewsets.ModelViewSet):
+    serializer_class = AssessmentSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        qs = Assessment.objects.select_related(
+            "classroom", "classroom__school", "created_by"
+        )
+
+        if is_school_admin(self.request.user):
+            return qs
+
+        return qs.filter(classroom__teacher=self.request.user)
+
+    def perform_create(self, serializer):
+        classroom = serializer.validated_data["classroom"]
+
+        if not is_school_admin(self.request.user):
+            if classroom.teacher_id != self.request.user.id:
+                raise PermissionDenied(
+                    "You can create assessments only for your own classes."
+                )
+
+        serializer.save(created_by=self.request.user)
+
+    def perform_update(self, serializer):
+        assessment = self.get_object()
+
+        if assessment.status != Assessment.Status.DRAFT:
+            raise PermissionDenied(
+                "Only draft assessments can be edited."
+            )
+
+        serializer.save()
+
+    
+    @action(detail=True, methods=["post"])
+    def publish(self, request, pk=None):
+        assessment = self.get_object()
+
+        # Only a school administrator or the assessment's teacher
+        # may publish it.
+        is_admin = (
+            request.user.is_superuser
+            or request.user.role == "SCHOOL_ADMIN"
+        )
+
+        if not is_admin and assessment.created_by_id != request.user.id:
+            raise PermissionDenied(
+                "You cannot publish another teacher's assessment."
+            )
+
+        if assessment.status != "DRAFT":
+            raise ValidationError(
+                "Only draft assessments can be published."
+            )
+
+        questions = Question.objects.filter(assessment=assessment)
+
+        if not questions.exists():
+            raise ValidationError(
+                "Add at least one question before publishing."
+            )
+
+        errors = []
+
+        for question in questions:
+            if question.question_type == "MULTIPLE_CHOICE":
+                options = QuestionOption.objects.filter(question=question)
+                correct_count = options.filter(is_correct=True).count()
+
+                if options.count() < 2:
+                    errors.append(
+                        f"Question {question.order}: add at least two options."
+                    )
+
+                if correct_count != 1:
+                    errors.append(
+                        f"Question {question.order}: mark exactly one correct option."
+                    )
+
+            if question.question_type == "ENUMERATION":
+                count = question.enum_item_count or 0
+                keys = question.key_items.count()
+
+                if count < 1 or not question.enum_points_per_item:
+                    errors.append(
+                        f"Question {question.order}: set the item count and points per item."
+                    )
+                elif question.enum_ordered and keys != count:
+                    errors.append(
+                        f"Question {question.order}: an ordered list needs exactly {count} answers."
+                    )
+                elif keys < count:
+                    errors.append(
+                        f"Question {question.order}: add at least {count} accepted answers."
+                    )
+
+            if question.points <= 0:
+                errors.append(
+                    f"Question {question.order}: points must be greater than zero."
+                )
+
+        if errors:
+            raise ValidationError({"questions": errors})
+
+        assessment.status = "PUBLISHED"
+        assessment.save(update_fields=["status", "updated_at"])
+
+        return Response(
+            {
+                "message": "Assessment published successfully.",
+                "assessment": self.get_serializer(assessment).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["post"])
+    def close(self, request, pk=None):
+        assessment = self.get_object()
+
+        is_admin = (
+            request.user.is_superuser
+            or request.user.role == "SCHOOL_ADMIN"
+        )
+
+        if not is_admin and assessment.created_by_id != request.user.id:
+            raise PermissionDenied(
+                "You cannot close another teacher's assessment."
+            )
+
+        if assessment.status != "PUBLISHED":
+            raise ValidationError(
+                "Only published assessments can be closed."
+            )
+
+        assessment.status = "CLOSED"
+        assessment.save(update_fields=["status", "updated_at"])
+
+        return Response(
+            {
+                "message": "Assessment closed successfully.",
+                "assessment": self.get_serializer(assessment).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+
+class QuestionViewSet(viewsets.ModelViewSet):
+    serializer_class = QuestionSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        qs = Question.objects.select_related(
+            "assessment", "assessment__classroom"
+        ).prefetch_related("options")
+
+        assessment_id = self.request.query_params.get("assessment")
+        if assessment_id and assessment_id.isdigit():
+            qs = qs.filter(assessment_id=int(assessment_id))
+
+        if is_school_admin(self.request.user):
+            return qs.order_by("order")
+
+        return qs.filter(
+            assessment__classroom__teacher=self.request.user
+        ).order_by("order")
+
+    def perform_create(self, serializer):
+        assessment = serializer.validated_data["assessment"]
+
+        if assessment.status != Assessment.Status.DRAFT:
+            raise PermissionDenied(
+                "Questions can only be added to draft assessments."
+            )
+
+        if not is_school_admin(self.request.user):
+            if assessment.classroom.teacher_id != self.request.user.id:
+                raise PermissionDenied(
+                    "You cannot edit another teacher's assessment."
+                )
+
+        serializer.save()
+
+    def perform_update(self, serializer):
+        question = self.get_object()
+
+        if question.assessment.status != Assessment.Status.DRAFT:
+            raise PermissionDenied(
+                "Questions in published assessments cannot be edited."
+            )
+
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if instance.assessment.status != Assessment.Status.DRAFT:
+            raise PermissionDenied(
+                "Questions in published assessments cannot be deleted."
+            )
+
+        instance.delete()
+
+==========================================================================================
+FILE: assessments/urls.py
+==========================================================================================
+from rest_framework.routers import DefaultRouter
+from .views import AssessmentViewSet, QuestionViewSet
+
+router = DefaultRouter()
+router.register("assessments", AssessmentViewSet, basename="assessment")
+router.register("questions", QuestionViewSet, basename="question")
+
+urlpatterns = router.urls
+
+==========================================================================================
+FILE: scanning/models.py
+==========================================================================================
+import uuid
+
+from django.conf import settings
+from django.db import models
+
+
+class ScanJob(models.Model):
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        PROCESSING = "PROCESSING", "Processing"
+        COMPLETED = "COMPLETED", "Completed"
+        FAILED = "FAILED", "Failed"
+
+    id = models.UUIDField(
+        primary_key=True,
+        default=uuid.uuid4,
+        editable=False,
+    )
+    assessment = models.ForeignKey(
+        "assessments.Assessment",
+        on_delete=models.PROTECT,
+        related_name="scan_jobs",
+    )
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="scan_jobs",
+    )
+    status = models.CharField(
+        max_length=12,
+        choices=Status.choices,
+        default=Status.PENDING,
+    )
+    total_files = models.PositiveIntegerField(default=0)
+    processed_files = models.PositiveIntegerField(default=0)
+    error_message = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return f"Scan {self.id} - {self.status}"
+
+class ScanFile(models.Model):
+    class Status(models.TextChoices):
+        UPLOADED = "UPLOADED", "Uploaded"
+        PROCESSING = "PROCESSING", "Processing"
+        COMPLETED = "COMPLETED", "Completed"
+        NEEDS_REVIEW = "NEEDS_REVIEW", "Needs Review"
+        FAILED = "FAILED", "Failed"
+
+    scan_job = models.ForeignKey(
+        "scanning.ScanJob",
+        on_delete=models.CASCADE,
+        related_name="files",
+    )
+    file = models.FileField(upload_to="scans/uploads/%Y/%m/")
+    original_filename = models.CharField(max_length=255)
+    content_type = models.CharField(max_length=100, blank=True)
+    size_bytes = models.PositiveBigIntegerField(default=0)
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.UPLOADED,
+    )
+    error_message = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    matched_student = models.ForeignKey(
+        "schools.Student",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="scan_files",
+    )
+    detected_student_id = models.CharField(max_length=50, blank=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return f"{self.original_filename} ({self.status})"
+
+class ScanResult(models.Model):
+    class Status(models.TextChoices):
+        DETECTED = "DETECTED", "Detected"
+        BLANK = "BLANK", "Blank"
+        MULTIPLE_MARKS = "MULTIPLE_MARKS", "Multiple Marks"
+        UNCERTAIN = "UNCERTAIN", "Uncertain"
+        ERROR = "ERROR", "Error"
+
+    scan_file = models.ForeignKey(
+        "scanning.ScanFile",
+        on_delete=models.CASCADE,
+        related_name="results",
+    )
+    question = models.ForeignKey(
+        "assessments.Question",
+        on_delete=models.CASCADE,
+        related_name="scan_results",
+    )
+    selected_label = models.CharField(max_length=10, blank=True)
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.UNCERTAIN,
+    )
+    confidence = models.FloatField(null=True, blank=True)
+    option_details = models.JSONField(default=list, blank=True)
+    reviewed = models.BooleanField(default=False)
+    reviewed_by = models.ForeignKey(
+        "accounts.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="reviewed_scan_results",
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["question__order"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scan_file", "question"],
+                name="unique_scan_result_per_question",
+            )
+        ]
+
+    def __str__(self):
+        return f"Scan {self.scan_file_id} - Question {self.question_id}"
+
+
+==========================================================================================
+FILE: scanning/serializers.py
+==========================================================================================
+
+from rest_framework import serializers
+
+from .models import ScanJob, ScanFile
+
+
+class ScanFileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ScanFile
+        fields = [
+            "id",
+            "original_filename",
+            "content_type",
+            "size_bytes",
+            "status",
+            "error_message",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class ScanJobSerializer(serializers.ModelSerializer):
+    files = ScanFileSerializer(many=True, read_only=True)
+    assessment_title = serializers.CharField(
+        source="assessment.title",
+        read_only=True,
+    )
+    uploaded_by_username = serializers.CharField(
+        source="uploaded_by.username",
+        read_only=True,
+    )
+
+    class Meta:
+        model = ScanJob
+        fields = [
+            "id",
+            "assessment",
+            "assessment_title",
+            "uploaded_by_username",
+            "status",
+            "total_files",
+            "processed_files",
+            "error_message",
+            "created_at",
+            "completed_at",
+            "files",
+        ]
+        read_only_fields = fields
+
+
+==========================================================================================
+FILE: scanning/views.py
+==========================================================================================
+from decimal import Decimal
+
+import math
+import os
+import tempfile
+
+import pymupdf  # PyMuPDF
+
+from .layout import QUESTIONS_PER_PAGE
+
+from django.shortcuts import render
+
+from .omr import detect_answers, detect_student_id
+from .matching import find_student_by_id
+from .preview import render_marked_sheet
+from django.http import HttpResponse
+from django.shortcuts import get_object_or_404
+from django.db.models import Sum
+
+from schools.models import Enrollment, Student
+from grading.models import Submission, GradeAuditLog, StudentAnswer
+
+from .omr import detect_answers, detect_student_id
+from .matching import find_student_by_id
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.views import APIView
+from rest_framework.exceptions import PermissionDenied, ValidationError
+
+from rest_framework import status
+
+import os
+
+from django.db import transaction
+from django.utils import timezone
+
+from rest_framework import serializers, status as http_status
+from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.response import Response
+
+from .models import ScanJob, ScanResult
+from .models import ScanJob, ScanFile
+
+from assessments.models import Assessment, Question, QuestionOption
+from .answer_sheets import generate_answer_sheet
+
+
+class AnswerSheetDownloadView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, assessment_id):
+        assessment = get_object_or_404(
+            Assessment.objects.select_related(
+                "classroom",
+                "created_by",
+            ),
+            pk=assessment_id,
+        )
+
+        user = request.user
+        is_admin = (
+            user.is_superuser
+            or user.role == "SCHOOL_ADMIN"
+        )
+
+        if not is_admin and assessment.classroom.teacher_id != user.id:
+            raise PermissionDenied(
+                "You cannot download another teacher's answer sheet."
+            )
+
+        if assessment.status != "PUBLISHED":
+            raise ValidationError(
+                "Only published assessments can have answer sheets downloaded."
+            )
+
+        pdf_buffer = generate_answer_sheet(assessment)
+
+        response = HttpResponse(
+            pdf_buffer.getvalue(),
+            content_type="application/pdf",
+        )
+        response["Content-Disposition"] = (
+            f'attachment; filename="papercheck-assessment-{assessment.pk}.pdf"'
+        )
+        return response
+
+
+
+class ScanUploadSerializer(serializers.Serializer):
+    files = serializers.ListField(
+        child=serializers.FileField(),
+        allow_empty=False,
+        min_length=1,
+        max_length=50,
+    )
+
+    def validate_files(self, files):
+        from PIL import Image, UnidentifiedImageError
+
+        allowed_extensions = {".jpg", ".jpeg", ".png", ".webp", ".pdf"}
+        max_file_size = 15 * 1024 * 1024
+
+        for file in files:
+            extension = os.path.splitext(file.name)[1].lower()
+
+            if extension not in allowed_extensions:
+                raise serializers.ValidationError(
+                    f"{file.name}: unsupported file type."
+                )
+
+            if file.size <= 0 or file.size > max_file_size:
+                raise serializers.ValidationError(
+                    f"{file.name}: file must be between 1 byte and 15 MB."
+                )
+
+            file.seek(0)
+            header = file.read(16)
+            file.seek(0)
+
+            if extension == ".pdf":
+                if not header.startswith(b"%PDF-"):
+                    raise serializers.ValidationError(
+                        f"{file.name}: invalid PDF file."
+                    )
+            else:
+                try:
+                    image = Image.open(file)
+                    image.verify()
+                except (
+                    UnidentifiedImageError,
+                    OSError,
+                    ValueError,
+                ):
+                    raise serializers.ValidationError(
+                        f"{file.name}: invalid or unsupported image."
+                    )
+                finally:
+                    file.seek(0)
+
+        return files
+
+
+class ScanUploadView(APIView):
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request, assessment_id):
+        assessment = get_object_or_404(
+            Assessment.objects.select_related("classroom", "created_by"),
+            pk=assessment_id,
+        )
+
+        user = request.user
+        is_admin = user.is_superuser or user.role == "SCHOOL_ADMIN"
+
+        if not is_admin and assessment.classroom.teacher_id != user.id:
+            raise PermissionDenied(
+                "You cannot upload scans for another teacher's assessment."
+            )
+
+        if assessment.status != "PUBLISHED":
+            raise ValidationError(
+                "Only published assessments can receive scanned answer sheets."
+            )
+
+        serializer = ScanUploadSerializer(data=request.data)
+        if not serializer.is_valid():
+            print("UPLOAD ERRORS:", serializer.errors)
+            print("FILES RECEIVED:", [(f.name, f.size, f.content_type) for f in request.FILES.getlist("files")])
+            serializer.is_valid(raise_exception=True)
+        files = serializer.validated_data["files"]
+
+        with transaction.atomic():
+            job = ScanJob.objects.create(
+                assessment=assessment,
+                uploaded_by=user,
+                status="PENDING",
+                total_files=len(files),
+            )
+
+            saved_files = []
+
+            for uploaded_file in files:
+                scan_file = ScanFile(
+                    scan_job=job,
+                    file=uploaded_file,
+                    original_filename=os.path.basename(uploaded_file.name)[:255],
+                    content_type=getattr(uploaded_file, "content_type", "") or "",
+                    size_bytes=uploaded_file.size,
+                    status=ScanFile.Status.UPLOADED,
+                )
+                scan_file.save()
+                saved_files.append(scan_file)
+
+        return Response(
+            {
+                "message": "Files uploaded successfully.",
+                "scan_job_id": str(job.id),
+                "status": job.status,
+                "total_files": len(saved_files),
+                "files": [
+                    {
+                        "id": scan_file.id,
+                        "filename": scan_file.original_filename,
+                        "status": scan_file.status,
+                    }
+                    for scan_file in saved_files
+                ],
+            },
+            status=http_status.HTTP_201_CREATED,
+        )
+
+
+from rest_framework import viewsets
+from .serializers import ScanJobSerializer
+
+
+class ScanJobViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = ScanJobSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+
+        queryset = ScanJob.objects.select_related(
+            "assessment",
+            "assessment__classroom",
+            "uploaded_by",
+        ).prefetch_related("files")
+
+        if user.is_superuser or user.role == "SCHOOL_ADMIN":
+            return queryset
+
+        return queryset.filter(
+            assessment__classroom__teacher=user
+        )
+
+
+
+
+class ScanFileProcessView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, scan_file_id):
+        user = request.user
+        is_admin = user.is_superuser or user.role == "SCHOOL_ADMIN"
+
+        queryset = ScanFile.objects.select_related(
+            "scan_job",
+            "scan_job__assessment",
+            "scan_job__assessment__classroom",
+        )
+
+        if not is_admin:
+            queryset = queryset.filter(
+                scan_job__assessment__classroom__teacher=user
+            )
+
+        scan_file = get_object_or_404(queryset, pk=scan_file_id)
+        job = scan_file.scan_job
+        assessment = job.assessment
+
+        if assessment.status != "PUBLISHED":
+            raise ValidationError(
+                "Only scans for published assessments can be processed."
+            )
+
+        if scan_file.status in {
+            ScanFile.Status.PROCESSING,
+            ScanFile.Status.COMPLETED,
+        }:
+            raise ValidationError(
+                "This file is already processing or has completed."
+            )
+
+        if not scan_file.file:
+            raise ValidationError("No uploaded file is attached to this scan.")
+
+        extension = os.path.splitext(scan_file.original_filename)[1].lower()
+
+        if extension not in {".jpg", ".jpeg", ".png", ".webp", ".pdf"}:
+            raise ValidationError("Unsupported file format.")
+
+        questions = list(
+            assessment.questions.filter(question_type="MULTIPLE_CHOICE")
+            .prefetch_related("options")
+            .order_by("order")
+        )
+
+        if not questions:
+            raise ValidationError(
+                "This assessment has no multiple-choice questions to scan."
+            )
+
+        expected_pages = max(
+            1,
+            math.ceil(len(questions) / QUESTIONS_PER_PAGE),
+        )
+
+        # Claim the file before starting CPU-intensive processing.
+        with transaction.atomic():
+            locked_file = ScanFile.objects.select_for_update().get(
+                pk=scan_file.pk
+            )
+
+            if locked_file.status in {
+                ScanFile.Status.PROCESSING,
+                ScanFile.Status.COMPLETED,
+            }:
+                raise ValidationError(
+                    "This file is already processing or has completed."
+                )
+
+            locked_file.status = ScanFile.Status.PROCESSING
+            locked_file.error_message = ""
+            locked_file.save(update_fields=["status", "error_message"])
+
+            ScanJob.objects.filter(pk=job.pk).update(
+                status=ScanJob.Status.PROCESSING,
+                error_message="",
+                completed_at=None,
+            )
+
+        try:
+            source_path = scan_file.file.path
+
+            if not os.path.isfile(source_path):
+                raise ValueError("The uploaded file could not be found.")
+
+            with tempfile.TemporaryDirectory(prefix="papercheck_omr_") as temp_dir:
+                # 1. Prepare page images
+                page_paths = []
+
+                if extension == ".pdf":
+                    with pymupdf.open(source_path) as pdf_document:
+                        if pdf_document.needs_pass:
+                            raise ValueError(
+                                "Password-protected PDFs are not supported."
+                            )
+
+                        if len(pdf_document) != expected_pages:
+                            raise ValueError(
+                                f"This assessment requires {expected_pages} "
+                                f"page(s), but the uploaded PDF contains "
+                                f"{len(pdf_document)} page(s). Upload the "
+                                f"complete answer sheet as one PDF."
+                            )
+
+                        render_matrix = pymupdf.Matrix(2, 2)
+
+                        for page_index, page in enumerate(pdf_document):
+                            pixmap = page.get_pixmap(
+                                matrix=render_matrix,
+                                alpha=False,
+                            )
+                            page_path = os.path.join(
+                                temp_dir,
+                                f"page_{page_index + 1}.png",
+                            )
+                            pixmap.save(page_path)
+                            page_paths.append(page_path)
+                else:
+                    if expected_pages > 1:
+                        raise ValueError(
+                            f"This assessment needs {expected_pages} pages. "
+                            "Upload all pages together as one PDF instead "
+                            "of uploading a single image."
+                        )
+
+                    page_paths = [source_path]
+
+                if len(page_paths) != expected_pages:
+                    raise ValueError(
+                        "The number of uploaded pages does not match "
+                        "the assessment's answer sheet."
+                    )
+
+                # 2. Detect the student ID from the first page
+                student_id_detection = detect_student_id(page_paths[0])
+
+                detected_student_id = str(
+                    student_id_detection.get("student_id") or ""
+                ).strip()
+
+                student_id_complete = bool(
+                    student_id_detection.get("complete", False)
+                )
+
+                suggested_student = None
+
+                if student_id_complete and detected_student_id:
+                    suggested_student = find_student_by_id(
+                        assessment,
+                        detected_student_id,
+                    )
+
+                # 3. Detect answers on every page
+                all_answers = []
+                total_questions_processed = 0
+
+                for page_index, page_path in enumerate(page_paths):
+                    page_result = detect_answers(
+                        page_path,
+                        assessment,
+                        page_index=page_index,
+                    )
+
+                    total_questions_processed += page_result[
+                        "questions_processed"
+                    ]
+
+                    for answer in page_result["answers"]:
+                        answer_with_page = dict(answer)
+                        answer_with_page["page_index"] = page_index
+                        all_answers.append(answer_with_page)
+
+                # 4. Validate and save the combined results
+                questions_by_id = {q.id: q for q in questions}
+
+                detected_question_ids = {
+                    answer["question_id"] for answer in all_answers
+                }
+                expected_question_ids = {q.id for q in questions}
+                missing_question_ids = (
+                    expected_question_ids - detected_question_ids
+                )
+
+                if missing_question_ids:
+                    missing_orders = [
+                        q.order
+                        for q in questions
+                        if q.id in missing_question_ids
+                    ]
+                    raise ValueError(
+                        "OMR detection did not return every question. "
+                        f"Missing question numbers: {missing_orders}. "
+                        "Check the page alignment and scan quality."
+                    )
+
+                # Preliminary count of cleanly detected correct answers.
+                correct_map = dict(
+                    QuestionOption.objects.filter(
+                        question__assessment=assessment,
+                        question__question_type="MULTIPLE_CHOICE",
+                        is_correct=True,
+                    ).values_list("question_id", "label")
+                )
+                correct_count = sum(
+                    1
+                    for answer in all_answers
+                    if answer["status"] == "DETECTED"
+                    and correct_map.get(answer["question_id"])
+                    == answer["selected_option"]
+                )
+
+                with transaction.atomic():
+                    locked_file = ScanFile.objects.select_for_update().get(
+                        pk=scan_file.pk
+                    )
+
+                    # Replace partial results from any earlier failed attempt.
+                    ScanResult.objects.filter(scan_file=locked_file).delete()
+
+                    for answer in all_answers:
+                        question = questions_by_id.get(answer["question_id"])
+
+                        if question is None:
+                            continue
+
+                        ScanResult.objects.create(
+                            scan_file=locked_file,
+                            question=question,
+                            selected_label=(
+                                answer.get("selected_option") or ""
+                            ),
+                            status=answer["status"],
+                            confidence=answer["confidence"],
+                            option_details=answer["options"],
+                        )
+
+                    locked_file.detected_student_id = detected_student_id
+                    locked_file.status = ScanFile.Status.COMPLETED
+                    locked_file.error_message = ""
+                    locked_file.save(
+                        update_fields=[
+                            "detected_student_id",
+                            "status",
+                            "error_message",
+                        ]
+                    )
+
+                    self.refresh_job_status(job.id)
+
+            # 5. Return combined results
+            return Response(
+                {
+                    "message": "Scan processing completed.",
+                    "scan_file_id": scan_file.id,
+                    "scan_job_id": str(job.id),
+                    "page_count": expected_pages,
+                    "questions_processed": total_questions_processed,
+                    "correct_count": correct_count,
+                    "answers": all_answers,
+                    "detected_student_id": detected_student_id,
+                    "student_id_complete": student_id_complete,
+                    "student_id_digits": student_id_detection.get(
+                        "digits", []
+                    ),
+                    "suggested_student": (
+                        {
+                            "id": suggested_student.id,
+                            "student_id": suggested_student.student_id,
+                            "name": (
+                                f"{suggested_student.first_name} "
+                                f"{suggested_student.last_name}"
+                            ),
+                        }
+                        if suggested_student
+                        else None
+                    ),
+                },
+                status=http_status.HTTP_200_OK,
+            )
+
+        except Exception as exc:
+            with transaction.atomic():
+                failed_file = ScanFile.objects.select_for_update().get(
+                    pk=scan_file.pk
+                )
+                failed_file.status = ScanFile.Status.FAILED
+                failed_file.error_message = str(exc)[:2000]
+                failed_file.save(update_fields=["status", "error_message"])
+
+                self.refresh_job_status(job.id)
+
+            return Response(
+                {
+                    "message": "Scan processing failed.",
+                    "scan_file_id": scan_file.id,
+                    "error": str(exc),
+                },
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+
+    @staticmethod
+    def refresh_job_status(job_id):
+        job = ScanJob.objects.select_for_update().get(pk=job_id)
+
+        terminal_statuses = [
+            ScanFile.Status.COMPLETED,
+            ScanFile.Status.FAILED,
+        ]
+
+        finished_count = job.files.filter(
+            status__in=terminal_statuses
+        ).count()
+
+        failed_count = job.files.filter(
+            status=ScanFile.Status.FAILED
+        ).count()
+
+        job.processed_files = finished_count
+
+        if finished_count >= job.total_files:
+            job.status = (
+                ScanJob.Status.FAILED
+                if failed_count
+                else ScanJob.Status.COMPLETED
+            )
+            job.completed_at = timezone.now()
+        else:
+            job.status = ScanJob.Status.PROCESSING
+            job.completed_at = None
+
+        job.save(
+            update_fields=[
+                "processed_files",
+                "status",
+                "completed_at",
+            ]
+        )
+
+class ScanFileResultsView(APIView):
+    """
+    Return the detected answers for one uploaded scan.
+    Only the assigned teacher or a school administrator may view them.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, scan_file_id):
+        user = request.user
+
+        is_admin = (
+            user.is_superuser
+            or user.role == "SCHOOL_ADMIN"
+        )
+
+        queryset = ScanFile.objects.select_related(
+            "scan_job",
+            "scan_job__assessment",
+            "scan_job__assessment__classroom",
+        )
+
+        if not is_admin:
+            queryset = queryset.filter(
+                scan_job__assessment__classroom__teacher=user
+            )
+
+        scan_file = get_object_or_404(
+            queryset,
+            pk=scan_file_id,
+        )
+
+        results = (
+            ScanResult.objects
+            .filter(scan_file=scan_file)
+            .select_related("question")
+            .prefetch_related("question__options")
+            .order_by("question__order")
+        )
+
+        data = []
+
+        for result in results:
+            data.append({
+                "id": result.id,
+                "question_id": result.question_id,
+                "question_order": result.question.order,
+                "question_prompt": result.question.prompt,
+                "selected_label": result.selected_label,
+                "status": result.status,
+                "confidence": result.confidence,
+                "option_details": result.option_details,
+                "reviewed": result.reviewed,
+                "options": [
+                    {
+                        "label": option.label,
+                        "text": option.text,
+                    }
+                    for option in result.question.options.all()
+                ],
+            })
+
+        unreviewed = [item for item in data if not item["reviewed"]]
+        needs_attention = [
+            item for item in unreviewed if item["status"] != "DETECTED"
+        ]
+
+        suggested = find_student_by_id(
+            scan_file.scan_job.assessment,
+            scan_file.detected_student_id,
+        )
+
+        correct_map = dict(
+            QuestionOption.objects.filter(
+                question__assessment=scan_file.scan_job.assessment,
+                is_correct=True,
+            ).values_list("question_id", "label")
+        )
+        correct_count = sum(
+            1
+            for item in data
+            if item["selected_label"]
+            and correct_map.get(item["question_id"]) == item["selected_label"]
+        )
+        blank_count = sum(1 for item in data if item["status"] == "BLANK")
+
+        return Response({
+            "scan_file_id": scan_file.id,
+            "original_filename": scan_file.original_filename,
+            "scan_status": scan_file.status,
+            "detected_student_id": scan_file.detected_student_id,
+            "matched_student_id": scan_file.matched_student_id,
+            "suggested_student": (
+                {
+                    "student_id": suggested.student_id,
+                    "name": f"{suggested.first_name} {suggested.last_name}",
+                }
+                if suggested
+                else None
+            ),
+            "total_results": len(data),
+            "correct_count": correct_count,
+            "blank_count": blank_count,
+            "shaded_count": len(data) - blank_count,
+            "unreviewed_count": len(unreviewed),
+            "needs_attention_count": len(needs_attention),
+            "results": data,
+        })
+
+
+class ScanResultReviewView(APIView):
+    """
+    Allow an authorized teacher to confirm or correct one detected answer.
+
+    Send:
+        {"selected_label": "B"}  to select option B
+        {"selected_label": ""}   to confirm a blank answer
+    """
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, scan_result_id):
+        user = request.user
+        is_admin = (
+            user.is_superuser
+            or user.role == "SCHOOL_ADMIN"
+        )
+
+        queryset = ScanResult.objects.select_related(
+            "scan_file",
+            "scan_file__scan_job",
+            "scan_file__scan_job__assessment",
+            "scan_file__scan_job__assessment__classroom",
+            "question",
+        )
+
+        if not is_admin:
+            queryset = queryset.filter(
+                scan_file__scan_job__assessment__classroom__teacher=user
+            )
+
+        result = get_object_or_404(
+            queryset,
+            pk=scan_result_id,
+        )
+
+        if "selected_label" not in request.data:
+            return Response(
+                {
+                    "message": (
+                        "Include selected_label. "
+                        "Use an empty string to confirm a blank answer."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        selected_label = request.data["selected_label"]
+
+        if not isinstance(selected_label, str):
+            return Response(
+                {"message": "selected_label must be a string."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        selected_label = selected_label.strip().upper()
+
+        valid_labels = set(
+            result.question.options.values_list("label", flat=True)
+        )
+
+        if selected_label and selected_label not in valid_labels:
+            return Response(
+                {
+                    "message": "Invalid option label for this question.",
+                    "valid_labels": sorted(valid_labels),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        result.selected_label = selected_label
+        result.status = (
+            ScanResult.Status.DETECTED
+            if selected_label
+            else ScanResult.Status.BLANK
+        )
+        result.reviewed = True
+        result.reviewed_by = user
+        result.reviewed_at = timezone.now()
+        result.save(
+            update_fields=[
+                "selected_label",
+                "status",
+                "reviewed",
+                "reviewed_by",
+                "reviewed_at",
+            ]
+        )
+
+        return Response({
+            "id": result.id,
+            "selected_label": result.selected_label,
+            "status": result.status,
+            "reviewed": True,
+            "reviewed_by": user.username,
+            "reviewed_at": result.reviewed_at,
+        })
+
+class ScanFileConfirmDetectedView(APIView):
+    """
+    Mark every cleanly detected answer as reviewed in one call.
+    Blank, multiple-mark, and uncertain answers stay unreviewed so the
+    teacher must resolve them individually.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, scan_file_id):
+        user = request.user
+        is_admin = user.is_superuser or user.role == "SCHOOL_ADMIN"
+
+        queryset = ScanFile.objects.all()
+
+        if not is_admin:
+            queryset = queryset.filter(
+                scan_job__assessment__classroom__teacher=user
+            )
+
+        scan_file = get_object_or_404(queryset, pk=scan_file_id)
+
+        if scan_file.status != ScanFile.Status.COMPLETED:
+            return Response(
+                {"message": "Process the scan before reviewing it."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        confirmed = (
+            ScanResult.objects.filter(scan_file=scan_file, reviewed=False)
+            .exclude(
+                status__in=[
+                    ScanResult.Status.MULTIPLE_MARKS,
+                    ScanResult.Status.UNCERTAIN,
+                    ScanResult.Status.ERROR,
+                ]
+            )
+            .update(
+                reviewed=True,
+                reviewed_by=user,
+                reviewed_at=timezone.now(),
+            )
+        )
+
+        remaining = ScanResult.objects.filter(
+            scan_file=scan_file,
+            reviewed=False,
+        ).count()
+
+        return Response({
+            "confirmed": confirmed,
+            "needs_attention_count": remaining,
+        })
+
+class ScanFilePreviewView(APIView):
+    """Return the scanned sheet as a JPEG marked with right and wrong answers."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, scan_file_id):
+        user = request.user
+        is_admin = user.is_superuser or user.role == "SCHOOL_ADMIN"
+
+        queryset = ScanFile.objects.select_related(
+            "scan_job", "scan_job__assessment"
+        )
+
+        if not is_admin:
+            queryset = queryset.filter(
+                scan_job__assessment__classroom__teacher=user
+            )
+
+        scan_file = get_object_or_404(queryset, pk=scan_file_id)
+
+        if scan_file.status != ScanFile.Status.COMPLETED:
+            return Response(
+                {"message": "Process the scan before previewing it."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not scan_file.file or not os.path.isfile(scan_file.file.path):
+            return Response(
+                {"message": "The uploaded file could not be found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        results_by_question = {
+            result.question_id: result
+            for result in ScanResult.objects.filter(scan_file=scan_file)
+        }
+
+        try:
+            jpeg = render_marked_sheet(
+                scan_file.file.path,
+                scan_file.scan_job.assessment,
+                results_by_question,
+            )
+        except ValueError as exc:
+            return Response(
+                {"message": str(exc)}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        return HttpResponse(jpeg, content_type="image/jpeg")
+
+class ScanFileGradeView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, scan_file_id):
+        user = request.user
+        is_admin = (
+            user.is_superuser
+            or user.role == "SCHOOL_ADMIN"
+        )
+
+        queryset = ScanFile.objects.select_related(
+            "scan_job",
+            "scan_job__assessment",
+            "scan_job__assessment__classroom",
+            "matched_student",
+        )
+
+        if not is_admin:
+            queryset = queryset.filter(
+                scan_job__assessment__classroom__teacher=user
+            )
+
+        scan_file = get_object_or_404(queryset, pk=scan_file_id)
+        assessment = scan_file.scan_job.assessment
+        classroom = assessment.classroom
+
+        if scan_file.status != ScanFile.Status.COMPLETED:
+            return Response(
+                {"message": "Process the scan before grading it."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        student_id = str(request.data.get("student_id", "")).strip()
+
+        if not student_id:
+            return Response(
+                {"message": "student_id is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        student = get_object_or_404(
+            Student,
+            school=classroom.school,
+            student_id=student_id,
+            is_active=True,
+        )
+
+        enrolled = Enrollment.objects.filter(
+            classroom=classroom,
+            student=student,
+            status="ENROLLED",
+        ).exists()
+
+        if not enrolled:
+            return Response(
+                {
+                    "message": (
+                        "This student is not actively enrolled "
+                        "in the assessment's classroom."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if (
+            scan_file.matched_student_id
+            and scan_file.matched_student_id != student.id
+        ):
+            return Response(
+                {
+                    "message": (
+                        "This scan is already matched to another student. "
+                        "Resolve the existing match before changing it."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        questions = list(
+            assessment.questions.filter(
+                question_type="MULTIPLE_CHOICE"
+            ).order_by("order")
+        )
+
+        if not questions:
+            return Response(
+                {
+                    "message": (
+                        "This assessment has no multiple-choice questions "
+                        "to grade with OMR."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        results_by_question = {
+            result.question_id: result
+            for result in ScanResult.objects.filter(
+                scan_file=scan_file,
+                question__assessment=assessment,
+            )
+        }
+
+        missing = [
+            question.order
+            for question in questions
+            if question.id not in results_by_question
+        ]
+
+        unreviewed = [
+            question.order
+            for question in questions
+            if (
+                question.id in results_by_question
+                and not results_by_question[question.id].reviewed
+            )
+        ]
+
+        if missing or unreviewed:
+            return Response(
+                {
+                    "message": (
+                        "Review every multiple-choice answer before grading."
+                    ),
+                    "missing_question_orders": missing,
+                    "unreviewed_question_orders": unreviewed,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            with transaction.atomic():
+                locked_file = ScanFile.objects.select_for_update().get(
+                    pk=scan_file.pk
+                )
+
+                if (
+                    locked_file.matched_student_id
+                    and locked_file.matched_student_id != student.id
+                ):
+                    return Response(
+                        {"message": "This scan is matched to another student."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                submission, created = Submission.objects.get_or_create(
+                    assessment=assessment,
+                    student=student,
+                    defaults={
+                        "scan_job": scan_file.scan_job,
+                        "original_file": scan_file.file.name,
+                        "status": "NEEDS_REVIEW",
+                    },
+                )
+
+                if not created and submission.status == "APPROVED":
+                    return Response(
+                        {
+                            "message": (
+                                "This submission is already approved. "
+                                "Do not overwrite an approved grade."
+                            )
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                score = Decimal("0.00")
+                correct_count = 0
+                answer_count = 0
+
+                for question in questions:
+                    result = results_by_question[question.id]
+                    selected_label = result.selected_label.strip().upper()
+
+                    selected_option = None
+
+                    if selected_label:
+                        selected_option = QuestionOption.objects.filter(
+                            question=question,
+                            label__iexact=selected_label,
+                        ).first()
+
+                        if selected_option is None:
+                            raise ValueError(
+                                f"Invalid answer label for question "
+                                f"{question.order}."
+                            )
+
+                    is_correct = bool(
+                        selected_option and selected_option.is_correct
+                    )
+
+                    awarded_points = (
+                        question.points
+                        if is_correct
+                        else Decimal("0.00")
+                    )
+
+                    StudentAnswer.objects.update_or_create(
+                        submission=submission,
+                        question=question,
+                        defaults={
+                            "selected_option": selected_option,
+                            "is_correct": is_correct,
+                            "awarded_points": awarded_points,
+                            "review_status": "CONFIRMED",
+                        },
+                    )
+
+                    score += awarded_points
+                    answer_count += 1
+
+                    if is_correct:
+                        correct_count += 1
+
+                submission.scan_job = scan_file.scan_job
+                submission.original_file = scan_file.file.name
+                submission.score = score
+                submission.status = "NEEDS_REVIEW"
+                submission.save(
+                    update_fields=[
+                        "scan_job",
+                        "original_file",
+                        "score",
+                        "status",
+                    ]
+                )
+
+                locked_file.matched_student = student
+                locked_file.save(update_fields=["matched_student"])
+
+            return Response(
+                {
+                    "message": (
+                        "Answers graded successfully. "
+                        "The score still requires teacher approval."
+                    ),
+                    "submission_id": submission.id,
+                    "student_id": student.student_id,
+                    "student_name": (
+                        f"{student.first_name} {student.last_name}"
+                    ),
+                    "assessment_id": assessment.id,
+                    "answers_graded": answer_count,
+                    "correct_answers": correct_count,
+                    "total_points_earned": str(score),
+                    "total_points_possible": str(
+                        sum(question.points for question in questions)
+                    ),
+                    "status": submission.status,
+                    "approved": False,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except ValueError as exc:
+            return Response(
+                {"message": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+
+class SubmissionApproveView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, submission_id):
+        user = request.user
+        is_admin = (
+            user.is_superuser
+            or user.role == "SCHOOL_ADMIN"
+        )
+
+        queryset = Submission.objects.select_related(
+            "assessment",
+            "assessment__classroom",
+            "student",
+        )
+
+        if not is_admin:
+            queryset = queryset.filter(
+                assessment__classroom__teacher=user
+            )
+
+        submission = get_object_or_404(
+            queryset,
+            pk=submission_id,
+        )
+
+        if submission.status == "APPROVED":
+            return Response(
+                {"message": "This submission has already been approved."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        if submission.status != "NEEDS_REVIEW":
+            return Response(
+                {
+                    "message": (
+                        "Only submissions awaiting review can be approved."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if submission.score is None:
+            return Response(
+                {"message": "There is no calculated score to approve."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            submission = Submission.objects.select_for_update().get(
+                pk=submission.pk
+            )
+
+            # Recheck status after acquiring the database lock.
+            if submission.status != "NEEDS_REVIEW":
+                return Response(
+                    {"message": "This submission is no longer awaiting review."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            previous_approved_score = submission.approved_score
+            final_score = submission.score
+
+            submission.approved_score = final_score
+            submission.approved_by = user
+            submission.approved_at = timezone.now()
+            submission.status = "APPROVED"
+
+            submission.save(
+                update_fields=[
+                    "approved_score",
+                    "approved_by",
+                    "approved_at",
+                    "status",
+                ]
+            )
+
+            GradeAuditLog.objects.create(
+                submission=submission,
+                question=None,
+                changed_by=user,
+                old_score=previous_approved_score,
+                new_score=final_score,
+                reason="Teacher approved the submission score.",
+            )
+
+        return Response({
+            "message": "Grade approved successfully.",
+            "submission_id": submission.id,
+            "student_id": submission.student.student_id,
+            "score": str(submission.approved_score),
+            "status": submission.status,
+            "approved_by": user.username,
+            "approved_at": submission.approved_at,
+        })
+
+
+class SubmissionListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        is_admin = (
+            user.is_superuser
+            or user.role == "SCHOOL_ADMIN"
+        )
+
+        queryset = Submission.objects.select_related(
+            "assessment",
+            "assessment__classroom",
+            "student",
+            "approved_by",
+        )
+
+        if not is_admin:
+            queryset = queryset.filter(
+                assessment__classroom__teacher=user
+            )
+
+        assessment_id = request.query_params.get("assessment_id")
+        student_id = request.query_params.get("student_id")
+        submission_status = request.query_params.get("status")
+
+        if assessment_id:
+            queryset = queryset.filter(
+                assessment_id=assessment_id
+            )
+
+        if student_id:
+            queryset = queryset.filter(
+                student__student_id=student_id
+            )
+
+        if submission_status:
+            valid_statuses = {
+                "UPLOADED",
+                "PROCESSING",
+                "NEEDS_REVIEW",
+                "APPROVED",
+                "FAILED",
+            }
+
+            if submission_status not in valid_statuses:
+                return Response(
+                    {
+                        "message": "Invalid status filter.",
+                        "valid_statuses": sorted(valid_statuses),
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            queryset = queryset.filter(status=submission_status)
+
+        submissions = list(queryset.order_by("-created_at"))
+
+        # Total possible points per assessment (multiple-choice only,
+        # which is what the scanner grades).
+        totals = {
+            row["assessment"]: row["total"]
+            for row in Question.objects.filter(
+                assessment_id__in={s.assessment_id for s in submissions},
+                question_type="MULTIPLE_CHOICE",
+            )
+            .order_by()
+            .values("assessment")
+            .annotate(total=Sum("points"))
+        }
+
+        data = []
+
+        for submission in submissions:
+            student = submission.student
+            assessment = submission.assessment
+
+            data.append({
+                "id": submission.id,
+                "student_pk": student.id,
+                "assessment_id": assessment.id,
+                "assessment_title": assessment.title,
+                "classroom_id": assessment.classroom_id,
+                "classroom_name": assessment.classroom.name,
+                "student_id": student.student_id,
+                "student_name": (
+                    f"{student.first_name} {student.last_name}"
+                ),
+                "status": submission.status,
+                "calculated_score": (
+                    str(submission.score)
+                    if submission.score is not None
+                    else None
+                ),
+                "approved_score": (
+                    str(submission.approved_score)
+                    if submission.approved_score is not None
+                    else None
+                ),
+                "total_points": str(totals.get(assessment.id, 0)),
+                "approved_by": (
+                    submission.approved_by.username
+                    if submission.approved_by
+                    else None
+                ),
+                "approved_at": submission.approved_at,
+                "created_at": submission.created_at,
+            })
+
+        return Response({
+            "count": len(data),
+            "results": data,
+        })
+
+
+class SubmissionAuditHistoryView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, submission_id):
+        user = request.user
+        is_admin = (
+            user.is_superuser
+            or user.role == "SCHOOL_ADMIN"
+        )
+
+        submissions = Submission.objects.select_related(
+            "assessment",
+            "assessment__classroom",
+            "student",
+        )
+
+        if not is_admin:
+            submissions = submissions.filter(
+                assessment__classroom__teacher=user
+            )
+
+        submission = get_object_or_404(
+            submissions,
+            pk=submission_id,
+        )
+
+        logs = (
+            GradeAuditLog.objects
+            .filter(submission=submission)
+            .select_related("changed_by", "question")
+            .order_by("-created_at")
+        )
+
+        history = []
+
+        for log in logs:
+            history.append({
+                "id": log.id,
+                "question_id": log.question_id,
+                "question_order": (
+                    log.question.order if log.question else None
+                ),
+                "changed_by": log.changed_by.username,
+                "old_score": (
+                    str(log.old_score)
+                    if log.old_score is not None
+                    else None
+                ),
+                "new_score": (
+                    str(log.new_score)
+                    if log.new_score is not None
+                    else None
+                ),
+                "reason": log.reason,
+                "created_at": log.created_at,
+            })
+
+        return Response({
+            "submission_id": submission.id,
+            "student_id": submission.student.student_id,
+            "student_name": (
+                f"{submission.student.first_name} "
+                f"{submission.student.last_name}"
+            ),
+            "assessment_title": submission.assessment.title,
+            "current_status": submission.status,
+            "current_score": (
+                str(submission.approved_score)
+                if submission.approved_score is not None
+                else (
+                    str(submission.score)
+                    if submission.score is not None
+                    else None
+                )
+            ),
+            "history_count": len(history),
+            "history": history,
+        })
+
+
+==========================================================================================
+FILE: scanning/urls.py
+==========================================================================================
+
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
+
+from .views import (
+    AnswerSheetDownloadView,
+    ScanUploadView,
+    ScanJobViewSet,
+    ScanFileConfirmDetectedView,
+    ScanFilePreviewView,
+    ScanFileProcessView,
+    ScanFileResultsView,
+    ScanResultReviewView,
+    ScanFileGradeView,
+    SubmissionApproveView,
+    SubmissionListView,
+    SubmissionAuditHistoryView,
+)
+
+router = DefaultRouter()
+router.register("scan-jobs", ScanJobViewSet, basename="scan-job")
+
+urlpatterns = [
+    # Answer sheet and scan uploads
+    path(
+        "assessments/<int:assessment_id>/answer-sheet/",
+        AnswerSheetDownloadView.as_view(),
+        name="answer-sheet-download",
+    ),
+    path(
+        "assessments/<int:assessment_id>/scan-uploads/",
+        ScanUploadView.as_view(),
+        name="scan-upload",
+    ),
+
+    # Scan processing and answer review
+    path(
+        "scan-files/<int:scan_file_id>/process/",
+        ScanFileProcessView.as_view(),
+        name="scan-file-process",
+    ),
+    path(
+        "scan-files/<int:scan_file_id>/results/",
+        ScanFileResultsView.as_view(),
+        name="scan-file-results",
+    ),
+    path(
+        "scan-results/<int:scan_result_id>/review/",
+        ScanResultReviewView.as_view(),
+        name="scan-result-review",
+    ),
+    path(
+        "scan-files/<int:scan_file_id>/confirm-detected/",
+        ScanFileConfirmDetectedView.as_view(),
+        name="scan-file-confirm-detected",
+    ),
+    path(
+        "scan-files/<int:scan_file_id>/preview/",
+        ScanFilePreviewView.as_view(),
+        name="scan-file-preview",
+    ),
+
+    # Grading
+    path(
+        "scan-files/<int:scan_file_id>/grade/",
+        ScanFileGradeView.as_view(),
+        name="scan-file-grade",
+    ),
+    path(
+        "submissions/",
+        SubmissionListView.as_view(),
+        name="submission-list",
+    ),
+    path(
+        "submissions/<int:submission_id>/approve/",
+        SubmissionApproveView.as_view(),
+        name="submission-approve",
+    ),
+    path(
+        "submissions/<int:submission_id>/audit-history/",
+        SubmissionAuditHistoryView.as_view(),
+        name="submission-audit-history",
+    ),
+
+    # Scan job listing
+    path("", include(router.urls)),
+]
+
+
+==========================================================================================
+FILE: scanning/layout.py
+==========================================================================================
+"""
+Single source of truth for answer-sheet geometry.
+
+All values are in PDF points (1/72 inch), origin at the bottom-left of the
+A4 page (ReportLab convention). answer_sheets.py (drawing) and omr.py
+(reading) both import from here so they cannot drift apart.
+"""
+
+from reportlab.lib.pagesizes import A4
+
+PAGE_WIDTH, PAGE_HEIGHT = A4
+MARGIN = 42
+
+# --- Answer grid: two columns of 25 per page ---
+QUESTIONS_PER_COLUMN = 25
+COLUMNS = 2
+QUESTIONS_PER_PAGE = QUESTIONS_PER_COLUMN * COLUMNS
+ROW_HEIGHT = 17
+
+COLUMN_WIDTH = 245
+COLUMN_LEFTS = [MARGIN, PAGE_WIDTH - MARGIN - COLUMN_WIDTH]
+
+GRID_TOP = PAGE_HEIGHT - 322      # "ANSWER GRID" heading baseline
+START_Y = GRID_TOP - 28           # column header reference line
+
+NUMBER_RIGHT_OFFSET = 46          # question number is right-aligned here
+BUBBLE_OFFSET_X = 66              # column A center, relative to column left
+BUBBLE_SPACING = 40
+BUBBLE_RADIUS = 6
+BUBBLE_Y_OFFSET = 1               # bubble center sits 1 pt above text baseline
+
+
+def row_baseline_y(row):
+    """Text baseline of a row within a column (PDF coordinates)."""
+    return START_Y - 18 - row * ROW_HEIGHT
+
+
+def bubble_center(slot, option_index):
+    """
+    Center of an answer bubble in PDF coordinates.
+    slot: question position on the page, 0-49 (0-24 left column,
+    25-49 right column). option_index: 0 = A, 1 = B, ...
+    """
+    column, row = divmod(slot, QUESTIONS_PER_COLUMN)
+    x = COLUMN_LEFTS[column] + BUBBLE_OFFSET_X + option_index * BUBBLE_SPACING
+    y = row_baseline_y(row) + BUBBLE_Y_OFFSET
+    return x, y
+
+
+# --- Corner alignment markers (solid black squares) ---
+MARKER_SIZE = 18
+MARKER_INSET = 14  # distance from page edge to the marker's outer edge
+
+
+def marker_rects():
+    """
+    Four corner markers as (x, y, size, size) in PDF coordinates.
+    Order: top-left, top-right, bottom-left, bottom-right.
+    """
+    left = MARKER_INSET
+    right = PAGE_WIDTH - MARKER_INSET - MARKER_SIZE
+    bottom = MARKER_INSET
+    top = PAGE_HEIGHT - MARKER_INSET - MARKER_SIZE
+    return [
+        (left, top, MARKER_SIZE, MARKER_SIZE),
+        (right, top, MARKER_SIZE, MARKER_SIZE),
+        (left, bottom, MARKER_SIZE, MARKER_SIZE),
+        (right, bottom, MARKER_SIZE, MARKER_SIZE),
+    ]
+
+
+def marker_centers():
+    """Marker centers in PDF coordinates, same order as marker_rects()."""
+    return [(x + w / 2, y + h / 2) for x, y, w, h in marker_rects()]
+
+
+# --- Student ID: write-in boxes on top, digit bubbles (0-9) underneath ---
+STUDENT_ID_DIGITS = 9
+
+ID_PANEL_LEFT = 300
+ID_PANEL_RIGHT = PAGE_WIDTH - MARGIN
+ID_PANEL_TOP = PAGE_HEIGHT - 108
+ID_PANEL_BOTTOM = PAGE_HEIGHT - 304
+
+ID_LABEL_X = ID_PANEL_LEFT + 14   # x of the 0-9 row labels
+ID_START_X = ID_PANEL_LEFT + 40   # x of the first digit column
+
+ID_BOX_WIDTH = 20
+ID_BOX_HEIGHT = 18
+ID_BOX_TOP = ID_PANEL_TOP - 24
+
+ID_ROW_PITCH = 14
+ID_BUBBLE_RADIUS = 5
+
+ID_DIGIT_SPACING = min(
+    26,
+    (ID_PANEL_RIGHT - 14 - ID_START_X) / max(STUDENT_ID_DIGITS - 1, 1),
+)
+
+
+def student_id_bubble_center(position, digit):
+    """
+    Center of an ID bubble in PDF coordinates.
+    position: 0 = leftmost digit column. digit: 0-9 (row 0 is at the top).
+    """
+    x = ID_START_X + position * ID_DIGIT_SPACING
+    y = ID_BOX_TOP - ID_BOX_HEIGHT - 14 - digit * ID_ROW_PITCH
+    return x, y
+
+
+def student_id_box_rect(position):
+    """Write-in box (x, y, width, height) above a digit column."""
+    cx = ID_START_X + position * ID_DIGIT_SPACING
+    return (
+        cx - ID_BOX_WIDTH / 2,
+        ID_BOX_TOP - ID_BOX_HEIGHT,
+        ID_BOX_WIDTH,
+        ID_BOX_HEIGHT,
+    )
+
+==========================================================================================
+FILE: scanning/answer_sheets.py
+==========================================================================================
+from io import BytesIO
+import math
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+
+from .layout import (
+    BUBBLE_OFFSET_X,
+    BUBBLE_RADIUS,
+    BUBBLE_SPACING,
+    COLUMN_LEFTS,
+    COLUMN_WIDTH,
+    GRID_TOP,
+    ID_BUBBLE_RADIUS,
+    ID_LABEL_X,
+    ID_PANEL_BOTTOM,
+    ID_PANEL_LEFT,
+    ID_PANEL_RIGHT,
+    ID_PANEL_TOP,
+    MARGIN,
+    NUMBER_RIGHT_OFFSET,
+    PAGE_HEIGHT,
+    PAGE_WIDTH,
+    QUESTIONS_PER_COLUMN,
+    QUESTIONS_PER_PAGE,
+    ROW_HEIGHT,
+    START_Y,
+    STUDENT_ID_DIGITS,
+    bubble_center,
+    marker_rects,
+    row_baseline_y,
+    student_id_box_rect,
+    student_id_bubble_center,
+)
+
+CONTENT_WIDTH = PAGE_WIDTH - (2 * MARGIN)
+MAX_CHOICES = 4  # A-D; the layout has room for four columns per question
+
+# Professional monochrome print palette
+INK = colors.HexColor("#172033")
+MUTED = colors.HexColor("#64748B")
+LIGHT_BORDER = colors.HexColor("#D7DEE8")
+ROW_SHADE = colors.HexColor("#F5F7FA")
+HEADER_SHADE = colors.HexColor("#E9EEF5")
+WHITE = colors.white
+
+
+def draw_bubble(pdf, x, y, radius=BUBBLE_RADIUS):
+    """Draw a clean, empty bubble for OMR scanning."""
+    pdf.setStrokeColor(INK)
+    pdf.setLineWidth(0.9)
+    pdf.circle(x, y, radius, stroke=1, fill=0)
+
+
+def draw_horizontal_rule(pdf, x1, y, x2, color=LIGHT_BORDER, width=0.6):
+    """Draw a consistent horizontal divider."""
+    pdf.setStrokeColor(color)
+    pdf.setLineWidth(width)
+    pdf.line(x1, y, x2, y)
+
+
+def draw_corner_markers(pdf):
+    """Draw solid black alignment squares at the four page corners."""
+    pdf.setFillColor(colors.black)
+    for x, y, w, h in marker_rects():
+        pdf.rect(x, y, w, h, stroke=0, fill=1)
+
+
+def draw_student_id_grid(pdf):
+    """Student ID: write-in box on top, digit bubbles 0-9 underneath."""
+    pdf.setStrokeColor(LIGHT_BORDER)
+    pdf.setLineWidth(0.8)
+    pdf.roundRect(
+        ID_PANEL_LEFT,
+        ID_PANEL_BOTTOM,
+        ID_PANEL_RIGHT - ID_PANEL_LEFT,
+        ID_PANEL_TOP - ID_PANEL_BOTTOM,
+        4,
+        stroke=1,
+        fill=0,
+    )
+
+    pdf.setFillColor(INK)
+    pdf.setFont("Helvetica-Bold", 7.5)
+    pdf.drawCentredString(
+        (ID_PANEL_LEFT + ID_PANEL_RIGHT) / 2,
+        ID_PANEL_TOP - 14,
+        "STUDENT ID",
+    )
+
+    # Write-in boxes
+    pdf.setStrokeColor(INK)
+    pdf.setLineWidth(0.8)
+    for position in range(STUDENT_ID_DIGITS):
+        x, y, w, h = student_id_box_rect(position)
+        pdf.rect(x, y, w, h, stroke=1, fill=0)
+
+    # Row labels 0-9
+    pdf.setFillColor(MUTED)
+    pdf.setFont("Helvetica-Bold", 7.5)
+    for digit in range(10):
+        _, y = student_id_bubble_center(0, digit)
+        pdf.drawCentredString(ID_LABEL_X, y - 2.5, str(digit))
+
+    # Digit bubbles
+    for position in range(STUDENT_ID_DIGITS):
+        for digit in range(10):
+            x, y = student_id_bubble_center(position, digit)
+            draw_bubble(pdf, x, y, radius=ID_BUBBLE_RADIUS)
+
+
+def generate_answer_sheet(assessment):
+    """
+    Generate a printable multiple-choice answer sheet.
+
+    Each page holds up to 50 questions in two columns of 25, plus a
+    student ID bubble grid and four corner alignment markers.
+
+    Geometry comes from scanning/layout.py, which the OMR detector also
+    imports. Do not hard-code grid positions here.
+    """
+    buffer = BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=A4)
+
+    questions = list(
+        assessment.questions
+        .filter(question_type="MULTIPLE_CHOICE")
+        .prefetch_related("options")
+        .order_by("order")
+    )
+
+    pdf.setTitle(f"Answer Sheet - {assessment.title}")
+    pdf.setAuthor("PaperCheck")
+
+    total_pages = max(1, math.ceil(len(questions) / QUESTIONS_PER_PAGE))
+
+    for page_index in range(total_pages):
+        page_questions = questions[
+            page_index * QUESTIONS_PER_PAGE:
+            (page_index + 1) * QUESTIONS_PER_PAGE
+        ]
+
+        left = MARGIN
+        right = PAGE_WIDTH - MARGIN
+
+        # --------------------------------------------------
+        # TOP HEADER
+        # --------------------------------------------------
+        top = PAGE_HEIGHT - 38
+
+        pdf.setFillColor(INK)
+        pdf.setFont("Helvetica-Bold", 17)
+        pdf.drawString(left, top, "PAPERCHECK")
+
+        pdf.setFillColor(MUTED)
+        pdf.setFont("Helvetica-Bold", 7.5)
+        pdf.drawRightString(right, top + 2, "MULTIPLE-CHOICE ANSWER SHEET")
+
+        draw_horizontal_rule(pdf, left, top - 11, right, INK, 1.2)
+
+        pdf.setFillColor(INK)
+        pdf.setFont("Helvetica-Bold", 13)
+        pdf.drawString(left, PAGE_HEIGHT - 78, assessment.title[:65])
+
+        pdf.setFillColor(MUTED)
+        pdf.setFont("Helvetica", 8)
+        pdf.drawString(left, PAGE_HEIGHT - 94, f"ASSESSMENT ID: {assessment.pk}")
+        pdf.drawRightString(
+            right,
+            PAGE_HEIGHT - 94,
+            f"PAGE {page_index + 1} OF {total_pages}",
+        )
+
+        # --------------------------------------------------
+        # STUDENT INFORMATION (left of the ID grid)
+        # --------------------------------------------------
+        info_width = ID_PANEL_LEFT - 12 - left
+        info_top = PAGE_HEIGHT - 108
+        info_bottom = PAGE_HEIGHT - 212
+
+        pdf.setFillColor(ROW_SHADE)
+        pdf.roundRect(
+            left,
+            info_bottom,
+            info_width,
+            info_top - info_bottom,
+            5,
+            stroke=0,
+            fill=1,
+        )
+
+        pdf.setFillColor(INK)
+        pdf.setFont("Helvetica-Bold", 8)
+        pdf.drawString(left + 12, info_top - 16, "STUDENT INFORMATION")
+
+        fields = [("NAME", 40), ("YEAR / SECTION", 64), ("DATE", 88)]
+        pdf.setLineWidth(0.65)
+        for label, offset in fields:
+            pdf.setFillColor(MUTED)
+            pdf.setFont("Helvetica-Bold", 7)
+            pdf.drawString(left + 12, info_top - offset, label)
+
+            pdf.setStrokeColor(INK)
+            pdf.line(
+                left + 88,
+                info_top - offset - 2,
+                left + info_width - 12,
+                info_top - offset - 2,
+            )
+
+        # Instructions
+        instructions_y = PAGE_HEIGHT - 230
+
+        pdf.setFillColor(INK)
+        pdf.setFont("Helvetica-Bold", 8)
+        pdf.drawString(left, instructions_y, "INSTRUCTIONS")
+
+        pdf.setFillColor(MUTED)
+        pdf.setFont("Helvetica", 7.5)
+        instruction_lines = [
+            "Use a dark pencil. Shade ONE circle per question.",
+            "Fill the circle completely; erase changes cleanly.",
+            "Student ID: write one digit in each box, then shade",
+            "the matching circle below it. Keep the sheet flat.",
+        ]
+        for line_index, line in enumerate(instruction_lines):
+            pdf.drawString(left, instructions_y - 13 - line_index * 11, line)
+
+        # --------------------------------------------------
+        # STUDENT ID GRID
+        # --------------------------------------------------
+        draw_student_id_grid(pdf)
+
+        # --------------------------------------------------
+        # ANSWER GRID
+        # --------------------------------------------------
+        columns_used = 2 if len(page_questions) > QUESTIONS_PER_COLUMN else 1
+
+        pdf.setFillColor(INK)
+        pdf.setFont("Helvetica-Bold", 9)
+        pdf.drawString(left, GRID_TOP, "ANSWER GRID")
+
+        pdf.setFillColor(MUTED)
+        pdf.setFont("Helvetica", 7)
+        pdf.drawRightString(
+            right,
+            GRID_TOP,
+            f"{len(page_questions)} QUESTIONS ON THIS PAGE",
+        )
+
+        header_y = START_Y + 8
+
+        pdf.setFillColor(HEADER_SHADE)
+        pdf.roundRect(left, header_y - 5, CONTENT_WIDTH, 24, 3, stroke=0, fill=1)
+
+        header_options = (
+            list(page_questions[0].options.all().order_by("label"))[:MAX_CHOICES]
+            if page_questions
+            else []
+        )
+
+        pdf.setFillColor(INK)
+        pdf.setFont("Helvetica-Bold", 7.5)
+        for column in range(columns_used):
+            col_left = COLUMN_LEFTS[column]
+            pdf.drawRightString(
+                col_left + NUMBER_RIGHT_OFFSET, header_y + 3, "NO."
+            )
+            for option_index, option in enumerate(header_options):
+                x = col_left + BUBBLE_OFFSET_X + option_index * BUBBLE_SPACING
+                pdf.drawCentredString(x, header_y + 3, option.label)
+
+        # Thin separator between the two columns
+        if columns_used == 2:
+            gap_x = (COLUMN_LEFTS[0] + COLUMN_WIDTH + COLUMN_LEFTS[1]) / 2
+            bottom_y = row_baseline_y(QUESTIONS_PER_COLUMN - 1) - 8
+            pdf.setStrokeColor(LIGHT_BORDER)
+            pdf.setLineWidth(0.6)
+            pdf.line(gap_x, header_y - 5, gap_x, bottom_y)
+
+        # Question rows
+        for slot, question in enumerate(page_questions):
+            column, row = divmod(slot, QUESTIONS_PER_COLUMN)
+            col_left = COLUMN_LEFTS[column]
+            y = row_baseline_y(row)
+
+            if row % 2 == 0:
+                pdf.setFillColor(ROW_SHADE)
+                pdf.rect(
+                    col_left,
+                    y - 8,
+                    COLUMN_WIDTH,
+                    ROW_HEIGHT,
+                    stroke=0,
+                    fill=1,
+                )
+
+            pdf.setFillColor(INK)
+            pdf.setFont("Helvetica-Bold", 8.5)
+            pdf.drawRightString(
+                col_left + NUMBER_RIGHT_OFFSET, y - 1, f"{question.order}."
+            )
+
+            options = list(question.options.all().order_by("label"))[:MAX_CHOICES]
+            for option_index, _option in enumerate(options):
+                bx, by = bubble_center(slot, option_index)
+                draw_bubble(pdf, bx, by, radius=BUBBLE_RADIUS)
+
+            draw_horizontal_rule(
+                pdf,
+                col_left,
+                y - 8,
+                col_left + COLUMN_WIDTH,
+                LIGHT_BORDER,
+                0.35,
+            )
+
+        # --------------------------------------------------
+        # FOOTER
+        # --------------------------------------------------
+        footer_y = 35
+
+        draw_horizontal_rule(pdf, left, footer_y + 12, right, LIGHT_BORDER, 0.7)
+
+        pdf.setFillColor(MUTED)
+        pdf.setFont("Helvetica-Bold", 7)
+        pdf.drawString(left, footer_y, "PAPERCHECK")
+
+        pdf.setFont("Helvetica", 7)
+        pdf.drawCentredString(
+            PAGE_WIDTH / 2,
+            footer_y,
+            "For machine scanning: avoid folds and stray marks.",
+        )
+
+        pdf.drawRightString(right, footer_y, f"ID: {assessment.pk}")
+
+        draw_corner_markers(pdf)
+
+        pdf.showPage()
+
+    pdf.save()
+    buffer.seek(0)
+    return buffer
+
+==========================================================================================
+FILE: grading/models.py
+==========================================================================================
+from django.conf import settings
+from django.db import models
+
+
+class Submission(models.Model):
+    class Status(models.TextChoices):
+        UPLOADED = "UPLOADED", "Uploaded"
+        PROCESSING = "PROCESSING", "Processing"
+        NEEDS_REVIEW = "NEEDS_REVIEW", "Needs Review"
+        APPROVED = "APPROVED", "Approved"
+        FAILED = "FAILED", "Failed"
+
+    assessment = models.ForeignKey(
+        "assessments.Assessment",
+        on_delete=models.PROTECT,
+        related_name="submissions",
+    )
+    student = models.ForeignKey(
+        "schools.Student",
+        on_delete=models.PROTECT,
+        related_name="submissions",
+    )
+    scan_job = models.ForeignKey(
+        "scanning.ScanJob",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="submissions",
+    )
+    original_file = models.ImageField(
+        upload_to="scans/original/%Y/%m/",
+    )
+    status = models.CharField(
+        max_length=15,
+        choices=Status.choices,
+        default=Status.UPLOADED,
+    )
+    score = models.DecimalField(
+        max_digits=9,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    approved_score = models.DecimalField(
+        max_digits=9,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="approved_submissions",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["assessment", "student"],
+                name="unique_submission_per_student_assessment",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.student} - {self.assessment.title}"
+
+
+class StudentAnswer(models.Model):
+    class ReviewStatus(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        CONFIRMED = "CONFIRMED", "Confirmed"
+        CORRECTED = "CORRECTED", "Corrected"
+
+    submission = models.ForeignKey(
+        Submission,
+        on_delete=models.CASCADE,
+        related_name="answers",
+    )
+    question = models.ForeignKey(
+        "assessments.Question",
+        on_delete=models.PROTECT,
+        related_name="student_answers",
+    )
+    selected_option = models.ForeignKey(
+        "assessments.QuestionOption",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="selected_answers",
+    )
+    extracted_text = models.TextField(blank=True)
+    confidence = models.FloatField(null=True, blank=True)
+    is_correct = models.BooleanField(null=True, blank=True)
+    awarded_points = models.DecimalField(
+        max_digits=7,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    review_status = models.CharField(
+        max_length=10,
+        choices=ReviewStatus.choices,
+        default=ReviewStatus.PENDING,
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["submission", "question"],
+                name="unique_answer_per_submission_question",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.submission} - Q{self.question.order}"
+
+
+class GradeAuditLog(models.Model):
+    submission = models.ForeignKey(
+        Submission,
+        on_delete=models.CASCADE,
+        related_name="grade_audit_logs",
+    )
+    question = models.ForeignKey(
+        "assessments.Question",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+    )
+    changed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+    )
+    old_score = models.DecimalField(
+        max_digits=9,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    new_score = models.DecimalField(
+        max_digits=9,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    reason = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Grade change - {self.submission_id}"
+
+==========================================================================================
+FILE: grading/serializers.py
+==========================================================================================
+[FILE NOT FOUND]
+
+
+==========================================================================================
+FILE: grading/views.py
+==========================================================================================
+from django.shortcuts import render
+
+# Create your views here.
+
+
+==========================================================================================
+FILE: grading/urls.py
+==========================================================================================
+[FILE NOT FOUND]
+
+
+==========================================================================================
+FILE: schools/models.py
+==========================================================================================
+from django.conf import settings
+from django.db import models
+
+
+class School(models.Model):
+    name = models.CharField(max_length=200)
+    code = models.CharField(max_length=30, unique=True)
+    address = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.name
+
+
+class Classroom(models.Model):
+    school = models.ForeignKey(
+        School,
+        on_delete=models.CASCADE,
+        related_name="classrooms",
+    )
+    name = models.CharField(max_length=100)
+    academic_year = models.CharField(max_length=20)
+    teacher = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="classrooms",
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["school", "name", "academic_year"],
+                name="unique_classroom_per_school_year",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.academic_year})"
+
+
+class Student(models.Model):
+    school = models.ForeignKey(
+        School,
+        on_delete=models.CASCADE,
+        related_name="students",
+    )
+    student_id = models.CharField(max_length=50)
+    first_name = models.CharField(max_length=100)
+    middle_name = models.CharField(max_length=100, blank=True)
+    last_name = models.CharField(max_length=100)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["last_name", "first_name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["school", "student_id"],
+                name="unique_student_id_per_school",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.student_id} - {self.last_name}, {self.first_name}"
+
+
+class Enrollment(models.Model):
+    class Status(models.TextChoices):
+        ENROLLED = "ENROLLED", "Enrolled"
+        INACTIVE = "INACTIVE", "Inactive"
+
+    classroom = models.ForeignKey(
+        Classroom,
+        on_delete=models.CASCADE,
+        related_name="enrollments",
+    )
+    student = models.ForeignKey(
+        Student,
+        on_delete=models.CASCADE,
+        related_name="enrollments",
+    )
+    status = models.CharField(
+        max_length=10,
+        choices=Status.choices,
+        default=Status.ENROLLED,
+    )
+    enrolled_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["classroom", "student"],
+                name="unique_student_enrollment_per_class",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.student} - {self.classroom}"
+
+==========================================================================================
+FILE: schools/serializers.py
+==========================================================================================
+from rest_framework import serializers
+from .models import School, Classroom, Student, Enrollment
+from django.utils.text import slugify
+
+
+class SchoolSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = School
+        fields = ["id", "name", "code", "address", "is_active", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+def _generate_school_code(name):
+    """Build a unique school code from the name, respecting max_length."""
+    max_length = School._meta.get_field("code").max_length or 20
+    base = (slugify(name).replace("-", "").upper() or "SCHOOL")[:max_length]
+
+    code = base
+    counter = 2
+    while School.objects.filter(code=code).exists():
+        suffix = str(counter)
+        code = base[: max_length - len(suffix)] + suffix
+        counter += 1
+
+    return code
+
+
+def _get_or_create_school(name):
+    """Find a school by name (case-insensitive) or create it."""
+    name = " ".join(name.split())
+
+    school = School.objects.filter(name__iexact=name).first()
+    if school:
+        if not school.is_active:
+            raise serializers.ValidationError(
+                {"school_name": "This school is inactive."}
+            )
+        return school
+
+    return School.objects.create(name=name, code=_generate_school_code(name))
+
+class ClassroomSerializer(serializers.ModelSerializer):
+    teacher_username = serializers.CharField(
+        source="teacher.username",
+        read_only=True,
+    )
+    school_name = serializers.CharField(
+        write_only=True,
+        required=False,
+        max_length=150,
+    )
+
+    class Meta:
+        model = Classroom
+        fields = [
+            "id",
+            "school",
+            "school_name",
+            "name",
+            "academic_year",
+            "teacher",
+            "teacher_username",
+            "is_active",
+            "created_at",
+        ]
+        read_only_fields = ["id", "teacher", "created_at"]
+        extra_kwargs = {"school": {"required": False}}
+        # The auto-generated unique-together validator would demand `school`,
+        # so uniqueness is checked manually in validate() instead.
+        validators = []
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["school_name"] = instance.school.name
+        return data
+
+    def validate(self, attrs):
+        school_name = (attrs.get("school_name") or "").strip()
+
+        if self.instance is None and not attrs.get("school") and not school_name:
+            raise serializers.ValidationError(
+                {"school_name": "Enter the school name."}
+            )
+
+        if school_name:
+            attrs["school"] = _get_or_create_school(school_name)
+
+        attrs.pop("school_name", None)
+
+        school = attrs.get("school") or (self.instance and self.instance.school)
+        name = attrs.get("name") or (self.instance and self.instance.name)
+        year = attrs.get("academic_year") or (
+            self.instance and self.instance.academic_year
+        )
+
+        duplicates = Classroom.objects.filter(
+            school=school, name=name, academic_year=year
+        )
+        if self.instance:
+            duplicates = duplicates.exclude(pk=self.instance.pk)
+
+        if duplicates.exists():
+            raise serializers.ValidationError(
+                "This classroom already exists for that school and academic year."
+            )
+
+        return attrs
+
+
+class StudentSerializer(serializers.ModelSerializer):
+    full_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Student
+        fields = [
+            "id", "school", "student_id", "first_name",
+            "middle_name", "last_name", "full_name",
+            "is_active", "created_at",
+        ]
+        read_only_fields = ["id", "created_at", "full_name"]
+
+    def get_full_name(self, obj):
+        return " ".join(
+            part for part in [
+                obj.first_name, obj.middle_name, obj.last_name
+            ] if part
+        )
+
+
+class EnrollmentSerializer(serializers.ModelSerializer):
+    student_name = serializers.SerializerMethodField()
+    classroom_name = serializers.CharField(
+        source="classroom.name",
+        read_only=True,
+    )
+
+    class Meta:
+        model = Enrollment
+        fields = [
+            "id", "classroom", "classroom_name",
+            "student", "student_name", "status", "enrolled_at",
+        ]
+        read_only_fields = ["id", "enrolled_at"]
+
+    def get_student_name(self, obj):
+        return f"{obj.student.first_name} {obj.student.last_name}"
+
+==========================================================================================
+FILE: schools/views.py
+==========================================================================================
+from rest_framework import viewsets
+from rest_framework.permissions import (
+    BasePermission,
+    IsAuthenticated,
+    SAFE_METHODS,
+)
+from rest_framework.exceptions import PermissionDenied, ValidationError
+
+from .models import School, Classroom, Student, Enrollment
+from .serializers import (
+    SchoolSerializer,
+    ClassroomSerializer,
+    StudentSerializer,
+    EnrollmentSerializer,
+)
+
+
+def is_school_admin(user):
+    return (
+        user.is_authenticated
+        and (user.is_superuser or user.role == "SCHOOL_ADMIN")
+    )
+
+
+class IsSchoolAdmin(BasePermission):
+    def has_permission(self, request, view):
+        return is_school_admin(request.user)
+
+
+class IsSchoolAdminOrReadOnly(BasePermission):
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+
+        return (
+            request.method in SAFE_METHODS
+            or is_school_admin(request.user)
+        )
+
+
+class SchoolViewSet(viewsets.ModelViewSet):
+    serializer_class = SchoolSerializer
+    permission_classes = [IsSchoolAdminOrReadOnly]
+
+    def get_queryset(self):
+        queryset = School.objects.all()
+
+        if not is_school_admin(self.request.user):
+            return queryset.filter(is_active=True)
+
+        return queryset
+
+
+class ClassroomViewSet(viewsets.ModelViewSet):
+    serializer_class = ClassroomSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = Classroom.objects.select_related("school", "teacher")
+
+        if is_school_admin(self.request.user):
+            return queryset
+
+        return queryset.filter(teacher=self.request.user)
+
+    def perform_create(self, serializer):
+        serializer.save(teacher=self.request.user)
+
+
+class StudentViewSet(viewsets.ModelViewSet):
+    serializer_class = StudentSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = Student.objects.select_related("school")
+
+        if is_school_admin(self.request.user):
+            return queryset
+
+        return queryset.filter(
+            enrollments__classroom__teacher=self.request.user
+        ).distinct()
+
+
+class EnrollmentViewSet(viewsets.ModelViewSet):
+    serializer_class = EnrollmentSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = Enrollment.objects.select_related(
+            "student",
+            "classroom",
+            "classroom__teacher",
+        )
+
+        if is_school_admin(self.request.user):
+            return queryset
+
+        return queryset.filter(classroom__teacher=self.request.user)
+
+    def perform_create(self, serializer):
+        classroom = serializer.validated_data["classroom"]
+        student = serializer.validated_data["student"]
+
+        if not is_school_admin(self.request.user):
+            if classroom.teacher_id != self.request.user.id:
+                raise PermissionDenied(
+                    "You cannot enroll students in another teacher's class."
+                )
+
+        if classroom.school_id != student.school_id:
+            raise ValidationError(
+                "The student and classroom must belong to the same school."
+            )
+
+        serializer.save()
+
+
+==========================================================================================
+FILE: schools/urls.py
+==========================================================================================
+from rest_framework.routers import DefaultRouter
+from .views import (
+    SchoolViewSet,
+    ClassroomViewSet,
+    StudentViewSet,
+    EnrollmentViewSet,
+)
+
+router = DefaultRouter()
+router.register("schools", SchoolViewSet, basename="school")
+router.register("classes", ClassroomViewSet, basename="classroom")
+router.register("students", StudentViewSet, basename="student")
+router.register("enrollments", EnrollmentViewSet, basename="enrollment")
+
+urlpatterns = router.urls
+
+==========================================================================================
+FILE: config/urls.py
+==========================================================================================
+
+from django.contrib import admin
+from django.urls import path, include
+from rest_framework_simplejwt.views import (
+    TokenObtainPairView,
+    TokenRefreshView,
+)
+
+urlpatterns = [
+    path("admin/", admin.site.urls),
+
+    # Authentication
+    path(
+        "api/v1/auth/login/",
+        TokenObtainPairView.as_view(),
+        name="token_obtain_pair",
+    ),
+    path(
+        "api/v1/auth/refresh/",
+        TokenRefreshView.as_view(),
+        name="token_refresh",
+    ),
+
+    # Account settings
+    path("api/v1/auth/", include("accounts.urls")),
+
+    # Existing application routes
+    path("api/v1/", include("schools.urls")),
+    path("api/v1/", include("assessments.urls")),
+    path("api/v1/", include("scanning.urls")),
+]
+
